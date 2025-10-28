@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+.DS_Store
+./.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment files
+.env
+oauth_credentials.json
+*.csv
