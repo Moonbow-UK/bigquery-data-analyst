@@ -19,6 +19,20 @@
     details { margin-bottom: 1.5rem; }
     summary { font-weight: bold; cursor: pointer; }
     code { background-color: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 3px; }
+    .hidden-row { display: none; }
+    .toggle-link {
+      margin-top: -0.2rem;
+      padding: 0;
+      border: none;
+      background: none;
+      color: #1976d2;
+      cursor: pointer;
+      font: inherit;
+      float: right;
+    }
+    .toggle-link:hover { text-decoration: underline; }
+    .toggle-link:focus { outline: 1px dotted #1976d2; }
+    .table-note { margin: -0.4rem 0 0.8rem; color: #555; font-size: 0.9rem; }
   </style>
 </head>
 <body>
@@ -115,9 +129,15 @@
       </section>
 
       {% for section in summary.csv_sections %}
+        {% set section_id = "csv-section-" ~ loop.index0 %}
+        {% set display_limit = 2 %}
+        {% set total_rows = section.rows|length %}
         <section>
           <h2>{{ section.title }}</h2>
-          <table>
+          {% if total_rows > display_limit %}
+            <p class="table-note">Showing top {{ display_limit }} of {{ total_rows }} rows.</p>
+          {% endif %}
+          <table data-section="{{ section_id }}">
             <thead>
               <tr>
                 <th>Label</th>
@@ -129,7 +149,8 @@
             </thead>
             <tbody>
               {% for row in section.rows %}
-                <tr>
+                {% set is_collapsible = loop.index > display_limit %}
+                <tr data-section-id="{{ section_id }}"{% if is_collapsible %} data-collapsible="true" class="hidden-row"{% else %} data-collapsible="false"{% endif %}>
                   <td>{{ row.label }}</td>
                   <td>{{ row.value }}</td>
                   {% if section.include_share %}
@@ -139,6 +160,9 @@
               {% endfor %}
             </tbody>
           </table>
+          {% if total_rows > display_limit %}
+            <button type="button" class="toggle-link" data-toggle-target="{{ section_id }}" aria-expanded="false">Show more</button>
+          {% endif %}
         </section>
       {% endfor %}
 
@@ -331,5 +355,28 @@
       </section>
     {% endif %}
   {% endif %}
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      document.querySelectorAll('[data-toggle-target]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          var targetId = button.getAttribute('data-toggle-target');
+          var rows = document.querySelectorAll('[data-section-id="' + targetId + '"][data-collapsible="true"]');
+          if (!rows.length) {
+            return;
+          }
+          var expanded = button.getAttribute('aria-expanded') === 'true';
+          rows.forEach(function (row) {
+            if (expanded) {
+              row.classList.add('hidden-row');
+            } else {
+              row.classList.remove('hidden-row');
+            }
+          });
+          button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          button.textContent = expanded ? 'Show more' : 'Show less';
+        });
+      });
+    });
+  </script>
 </body>
 </html>

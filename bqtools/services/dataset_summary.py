@@ -264,7 +264,7 @@ class DatasetSummaryService:
         table_details: list[dict[str, Any]] = []
         csv_sections: list[dict[str, Any]] = []
 
-        def add_section(name: str, rows: list[dict[str, str | None]], total_count: int) -> None:
+        def add_section(name: str, rows: list[dict[str, Any]], total_count: int) -> None:
             dataset_info["table_count"] += 1
             csv_sections.append(
                 {
@@ -316,23 +316,41 @@ class DatasetSummaryService:
         )
 
         headline_rows = [
-            {"label": "Total events", "value": f"{csv_summary.total_events:,}", "share": None},
-            {"label": "Unique users", "value": f"{csv_summary.unique_users:,}", "share": None},
-            {"label": "Unique sessions", "value": f"{csv_summary.unique_sessions:,}", "share": None},
+            {
+                "label": "Total events",
+                "value": f"{csv_summary.total_events:,}",
+                "share": None,
+                "raw_value": float(csv_summary.total_events or 0),
+            },
+            {
+                "label": "Unique users",
+                "value": f"{csv_summary.unique_users:,}",
+                "share": None,
+                "raw_value": float(csv_summary.unique_users or 0),
+            },
+            {
+                "label": "Unique sessions",
+                "value": f"{csv_summary.unique_sessions:,}",
+                "share": None,
+                "raw_value": float(csv_summary.unique_sessions or 0),
+            },
             {
                 "label": "Engaged sessions",
                 "value": f"{csv_summary.engaged_sessions:,}",
                 "share": f"{engaged_rate:.1%}",
+                "raw_value": float(csv_summary.engaged_sessions or 0),
             },
             {
                 "label": "Avg. events per session",
                 "value": f"{avg_events_per_session:.1f}",
                 "share": None,
+                "raw_value": float(avg_events_per_session or 0),
             },
             {
                 "label": "Avg. engagement per session",
                 "value": f"{avg_engagement_seconds:.1f} sec",
                 "share": None,
+                "raw_value": float(avg_engagement_seconds or 0),
             },
         ]
         if csv_summary.total_revenue:
@@ -341,6 +359,7 @@ class DatasetSummaryService:
                     "label": "Revenue (USD)",
                     "value": f"${csv_summary.total_revenue:,.2f}",
                     "share": None,
+                    "raw_value": float(csv_summary.total_revenue or 0),
                 }
             )
         headline_rows.append(
@@ -352,14 +371,16 @@ class DatasetSummaryService:
                     if csv_summary.conversion_rate is not None
                     else None
                 ),
+                "raw_value": float(csv_summary.conversions or 0),
             }
         )
+        headline_rows.sort(key=lambda row: row.get("raw_value", 0.0), reverse=True)
         add_section("Key metrics", headline_rows, csv_summary.total_events)
 
         def counter_rows(title: str, counter: Counter[str], base: Optional[int], limit: int) -> None:
             if not counter:
                 return
-            rows: list[dict[str, str | None]] = []
+            rows: list[dict[str, Any]] = []
             total = sum(counter.values())
             denominator = base or total or 1
             for label, count in counter.most_common(limit):
@@ -369,6 +390,7 @@ class DatasetSummaryService:
                         "label": label,
                         "value": f"{count:,}",
                         "share": f"{share:.1%}",
+                        "raw_value": float(count),
                     }
                 )
             add_section(title, rows, total)
