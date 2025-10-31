@@ -11,3 +11,7 @@ __pycache__/
 .env
 oauth_credentials.json
 *.csv
+*.json
+.vscode
+var/logs/
+db_diagram.mmd
