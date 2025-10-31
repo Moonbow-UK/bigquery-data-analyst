@@ -32,20 +32,27 @@
     .toggle-link:hover { text-decoration: underline; }
     .toggle-link:focus { outline: 1px dotted #1976d2; }
     .table-note { margin: -0.4rem 0 0.8rem; color: #555; font-size: 0.9rem; }
+    .progress-panel { border: 1px solid #d0d7de; border-radius: 6px; padding: 1rem; margin-bottom: 1.5rem; background: #f8fafc; }
+    .progress-panel[hidden] { display: none !important; }
+    .progress-bar { height: 10px; background: #e0e7ef; border-radius: 999px; overflow: hidden; margin-bottom: 0.75rem; position: relative; }
+    .progress-bar__fill { height: 100%; width: 0; background: #1976d2; transition: width 0.25s ease; }
+    .progress-message { margin: 0 0 0.6rem; font-weight: 600; color: #0b3d91; }
+    .progress-steps { list-style: none; margin: 0; padding: 0; color: #374151; font-size: 0.95rem; display: grid; gap: 0.35rem; }
+    .progress-steps li { position: relative; padding-left: 1.2rem; }
+    .progress-steps li::before { content: '•'; position: absolute; left: 0; color: #1976d2; }
+    .is-loading { opacity: 0.5; transition: opacity 0.2s ease; }
   </style>
 </head>
 <body>
   <h1>BigQuery Dataset Summary</h1>
 
-  {% if error_message %}
-    <div class="error">{{ error_message }}</div>
-  {% endif %}
+  <div id="error-container">
+    {% if error_message %}
+      <div class="error">{{ error_message }}</div>
+    {% endif %}
+  </div>
 
-  {% if filter_note %}
-    <div class="note">{{ filter_note }}</div>
-  {% endif %}
-
-  <form method="post">
+  <form method="post" data-summary-form="true">
     <div class="form-field">
       <label for="date_range">Date range</label>
       <select id="date_range" name="date_range">
@@ -60,261 +67,202 @@
     <button type="submit" name="action" value="generate">Generate summary</button>
   </form>
 
-  {% if summary_generated and summary %}
-    {% if summary.mode == 'csv' %}
-      <section>
-        <p><strong>Rows analysed:</strong> {{ summary.ga4_summary.total_events }} | <strong>Sections:</strong> {{ summary.dataset.table_count }}</p>
-      </section>
+  <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="progress-bar__fill" id="progress-bar-fill"></div>
+    </div>
+    <p class="progress-message" id="progress-message">Preparing…</p>
+    <ul class="progress-steps" id="progress-steps" aria-live="polite" aria-atomic="false"></ul>
+  </section>
 
-      {% for section in summary.csv_sections %}
-        {% set section_id = "csv-section-" ~ loop.index0 %}
-        {% set display_limit = 10 %}
-        {% set total_rows = section.rows|length %}
-        <section>
-          <h2>{{ section.title }}</h2>
-          {% if total_rows > display_limit %}
-            <p class="table-note">Showing top {{ display_limit }} of {{ total_rows }} rows.</p>
-          {% endif %}
-          <table data-section="{{ section_id }}">
-            <thead>
-              <tr>
-                <th>Label</th>
-                <th>Value</th>
-                {% if section.include_share %}
-                <th>Share</th>
-                {% endif %}
-              </tr>
-            </thead>
-            <tbody>
-              {% for row in section.rows %}
-                {% set is_collapsible = loop.index > display_limit %}
-                <tr data-section-id="{{ section_id }}"{% if is_collapsible %} data-collapsible="true" class="hidden-row"{% else %} data-collapsible="false"{% endif %}>
-                  <td>{{ row.label }}</td>
-                  <td>{{ row.value }}</td>
-                  {% if section.include_share %}
-                  <td>{{ row.share if row.share else '—' }}</td>
-                  {% endif %}
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-          {% if total_rows > display_limit %}
-            <button type="button" class="toggle-link" data-toggle-target="{{ section_id }}" aria-expanded="false">Show more</button>
-          {% endif %}
-        </section>
-      {% endfor %}
-
-      {% if summary.csv_report_text %}
-        <details>
-          <summary>View narrative</summary>
-          <pre style="white-space: pre-wrap; background:#f6f8fa; padding:1rem; border-radius:6px;">{{ summary.csv_report_text }}</pre>
-        </details>
-      {% endif %}
-    {% else %}
-      <section>
-        <h2>Dataset metadata</h2>
-        <table>
-          <tbody>
-            <tr><th>Dataset</th><td>{{ summary.dataset.project }}.{{ summary.dataset.dataset_id }}</td></tr>
-            <tr><th>Location</th><td>{{ summary.dataset.location or 'unspecified' }}</td></tr>
-            <tr><th>Default table expiration</th><td>{{ summary.dataset.default_table_expiration_ms or 'not set' }}</td></tr>
-            <tr><th>Default partition expiration</th><td>{{ summary.dataset.default_partition_expiration_ms or 'not set' }}</td></tr>
-            <tr><th>Labels</th><td>{{ summary.dataset.labels or '{}' }}</td></tr>
-            <tr><th>Description</th><td>{{ summary.dataset.description or 'No dataset description provided.' }}</td></tr>
-            <tr><th>Tables found</th><td>{{ summary.dataset.table_count }}</td></tr>
-          </tbody>
-        </table>
-      </section>
-
-      <section>
-        <h2>Table overview</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Table</th>
-              <th>Type</th>
-              <th>Rows</th>
-              <th>Storage</th>
-              <th>Last modified</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in summary.table_overview %}
-              <tr>
-                <td>{{ row.table_id }}</td>
-                <td>{{ row.table_type }}</td>
-                <td>
-                  {% if row.error %}
-                    n/a
-                  {% elif row.num_rows is not none %}
-                    {{ "{:,}".format(row.num_rows) }}
-                  {% else %}
-                    n/a
-                  {% endif %}
-                </td>
-                <td>
-                  {% if row.error %}
-                    n/a
-                  {% elif row.num_bytes is not none %}
-                    {{ row.num_bytes|filesizeformat(true) }}
-                  {% else %}
-                    n/a
-                  {% endif %}
-                </td>
-                <td>
-                  {% if row.error %}
-                    Failed to load ({{ row.error }})
-                  {% elif row.modified %}
-                    {{ row.modified.strftime("%Y-%m-%d %H:%M:%S UTC") }}
-                  {% else %}
-                    n/a
-                  {% endif %}
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </section>
-
-      <section>
-        <h2>Table details</h2>
-        {% for table in summary.tables %}
-          <details open>
-            <summary>{{ table.full_table_id }}</summary>
-            <p>
-              <strong>Type:</strong> {{ table.table_type }} |
-              <strong>Rows:</strong> {{ table.num_rows is not none and "{:,}".format(table.num_rows) or 'n/a' }} |
-              <strong>Storage:</strong>
-              {% if table.num_bytes is not none %}
-                {{ table.num_bytes|filesizeformat(true) }}
-              {% else %}
-                n/a
-              {% endif %} |
-              <strong>Last modified:</strong>
-              {% if table.modified %}
-                {{ table.modified.strftime("%Y-%m-%d %H:%M:%S UTC") }}
-              {% else %}
-                n/a
-              {% endif %}
-            </p>
-            {% if table.description %}
-              <p><strong>Description:</strong> {{ table.description }}</p>
-            {% endif %}
-            {% if table.time_partitioning %}
-              <p><strong>Partitioned by:</strong> {{ table.time_partitioning.field or 'ingestion_time' }} ({{ table.time_partitioning.type }})</p>
-            {% endif %}
-            {% if table.range_partitioning %}
-              <p><strong>Range partitioning:</strong> {{ table.range_partitioning.field }} [{{ table.range_partitioning.start }}, {{ table.range_partitioning.end }}) step {{ table.range_partitioning.interval }}</p>
-            {% endif %}
-            {% if table.clustering_fields %}
-              <p><strong>Clustering:</strong> {{ table.clustering_fields|join(', ') }}</p>
-            {% endif %}
-
-            <h3>Schema</h3>
-            <table>
-              <thead>
-                <tr>
-                  <th>Field</th>
-                  <th>Type</th>
-                  <th>Mode</th>
-                  <th>Description</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for field in table.schema %}
-                  <tr>
-                    <td>{{ field.name }}</td>
-                    <td>{{ field.type }}</td>
-                    <td>{{ field.mode }}</td>
-                    <td>{{ field.description or '—' }}</td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-
-            {% if table.numeric_stats %}
-              <h3>Numeric/date stats</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Column</th>
-                    <th>Min</th>
-                    <th>Max</th>
-                    <th>Avg</th>
-                    <th>Null ratio</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for stat in table.numeric_stats %}
-                    <tr>
-                      <td>{{ stat.column }}</td>
-                      <td>{{ stat.min_value or 'n/a' }}</td>
-                      <td>{{ stat.max_value or 'n/a' }}</td>
-                      <td>{{ stat.avg_value or 'n/a' }}</td>
-                      <td>{{ stat.null_ratio is not none and '{:.2%}'.format(stat.null_ratio) or 'n/a' }}</td>
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            {% elif table.numeric_stats_error %}
-              <p><em>Numeric/date stats unavailable: {{ table.numeric_stats_error }}</em></p>
-            {% endif %}
-
-            {% if table.categorical_stats %}
-              <h3>Categorical stats</h3>
-              {% for stat in table.categorical_stats %}
-                <h4>{{ stat.field }}</h4>
-                {% if stat.error %}
-                  <p><em>{{ stat.error }}</em></p>
-                {% else %}
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Value</th>
-                        <th>Count</th>
-                        <th>Ratio</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {% for value in stat.top_values %}
-                        <tr>
-                          <td>{{ value.value }}</td>
-                          <td>{{ value.count|int }}</td>
-                          <td>{{ value.ratio is not none and '{:.2%}'.format(value.ratio) or 'n/a' }}</td>
-                        </tr>
-                      {% endfor %}
-                    </tbody>
-                  </table>
-                {% endif %}
-              {% endfor %}
-            {% endif %}
-          </details>
-        {% endfor %}
-      </section>
+  <div id="summary-output">
+    {% if summary_generated and summary %}
+      {% include "summary_content.html" %}
     {% endif %}
-  {% endif %}
+  </div>
+
   <script>
-    document.addEventListener('DOMContentLoaded', function () {
-      document.querySelectorAll('[data-toggle-target]').forEach(function (button) {
-        button.addEventListener('click', function () {
-          var targetId = button.getAttribute('data-toggle-target');
-          var rows = document.querySelectorAll('[data-section-id="' + targetId + '"][data-collapsible="true"]');
-          if (!rows.length) {
+    (function () {
+      function attachToggleHandlers(root) {
+        if (!root) {
+          return;
+        }
+        root.querySelectorAll('[data-toggle-target]').forEach(function (button) {
+          if (button.dataset.toggleBound === 'true') {
             return;
           }
-          var expanded = button.getAttribute('aria-expanded') === 'true';
-          rows.forEach(function (row) {
-            if (expanded) {
-              row.classList.add('hidden-row');
-            } else {
-              row.classList.remove('hidden-row');
+          button.dataset.toggleBound = 'true';
+          button.addEventListener('click', function () {
+            var targetId = button.getAttribute('data-toggle-target');
+            var rows = root.querySelectorAll('[data-section-id="' + targetId + '"][data-collapsible="true"]');
+            if (!rows.length) {
+              return;
+            }
+            var expanded = button.getAttribute('aria-expanded') === 'true';
+            rows.forEach(function (row) {
+              if (expanded) {
+                row.classList.add('hidden-row');
+              } else {
+                row.classList.remove('hidden-row');
+              }
+            });
+            button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+            button.textContent = expanded ? 'Show more' : 'Show less';
+          });
+        });
+      }
+
+      document.addEventListener('DOMContentLoaded', function () {
+        attachToggleHandlers(document);
+      });
+
+      var form = document.querySelector('[data-summary-form]');
+      if (!form || !window.fetch || typeof ReadableStream === 'undefined' || typeof TextDecoder === 'undefined') {
+        return;
+      }
+
+      var submitButton = form.querySelector('button[type="submit"]');
+      var progressPanel = document.getElementById('progress-panel');
+      var progressBar = document.getElementById('progress-bar');
+      var progressFill = document.getElementById('progress-bar-fill');
+      var progressMessage = document.getElementById('progress-message');
+      var progressSteps = document.getElementById('progress-steps');
+      var summaryOutput = document.getElementById('summary-output');
+      var errorContainer = document.getElementById('error-container');
+
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        if (submitButton) {
+          submitButton.disabled = true;
+        }
+        errorContainer.innerHTML = '';
+        progressSteps.innerHTML = '';
+        progressPanel.hidden = false;
+        summaryOutput.classList.add('is-loading');
+        updateProgress(0.02, 'Preparing summary request…');
+
+        var rangeSelect = form.querySelector('#date_range');
+        var payload = {
+          date_range: rangeSelect ? rangeSelect.value : 'today'
+        };
+
+        fetchSummary(payload)
+          .catch(function (error) {
+            showError(error && error.message ? error.message : 'Failed to generate summary.');
+          })
+          .finally(function () {
+            summaryOutput.classList.remove('is-loading');
+            if (submitButton) {
+              submitButton.disabled = false;
             }
           });
-          button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-          button.textContent = expanded ? 'Show more' : 'Show less';
-        });
       });
-    });
+
+      function updateProgress(progressValue, message) {
+        var value = Math.max(0, Math.min(progressValue || 0, 1));
+        var percent = Math.round(value * 100);
+        progressFill.style.width = Math.max(2, Math.min(percent, 100)) + '%';
+        progressBar.setAttribute('aria-valuenow', String(percent));
+        progressMessage.textContent = message || 'Working…';
+      }
+
+      function addStep(message) {
+        if (!message) {
+          return;
+        }
+        var item = document.createElement('li');
+        item.textContent = message;
+        progressSteps.appendChild(item);
+      }
+
+      function showError(message) {
+        progressPanel.hidden = true;
+        var errorBlock = document.createElement('div');
+        errorBlock.className = 'error';
+        errorBlock.textContent = message;
+        errorContainer.innerHTML = '';
+        errorContainer.appendChild(errorBlock);
+      }
+
+      function renderSummary(html) {
+        if (typeof html === 'string') {
+          summaryOutput.innerHTML = html;
+          attachToggleHandlers(summaryOutput);
+        }
+        progressPanel.hidden = true;
+      }
+
+      async function fetchSummary(payload) {
+        var response;
+        try {
+          response = await fetch('/api/progress-summary', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+        } catch (networkError) {
+          throw new Error('Network error while requesting summary.');
+        }
+
+        if (!response.ok) {
+          throw new Error('Request failed (' + response.status + ').');
+        }
+        if (!response.body || typeof response.body.getReader !== 'function') {
+          throw new Error('Streaming responses are not supported in this browser.');
+        }
+
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        var completed = false;
+        var errorMessage = null;
+
+        while (true) {
+          var result = await reader.read();
+          if (result.done) {
+            break;
+          }
+          buffer += decoder.decode(result.value, { stream: true });
+          var newlineIndex;
+          while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+            var line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (!line) {
+              continue;
+            }
+            var eventData;
+            try {
+              eventData = JSON.parse(line);
+            } catch (parseError) {
+              continue;
+            }
+
+            if (eventData.type === 'status') {
+              updateProgress(eventData.progress, eventData.message);
+            } else if (eventData.type === 'note') {
+              addStep(eventData.message);
+            } else if (eventData.type === 'complete') {
+              completed = true;
+              updateProgress(1, 'Summary ready.');
+              renderSummary(eventData.html);
+            } else if (eventData.type === 'error') {
+              errorMessage = eventData.message || 'Summary generation failed.';
+            }
+          }
+
+          if (errorMessage) {
+            break;
+          }
+        }
+
+        if (errorMessage) {
+          throw new Error(errorMessage);
+        }
+        if (!completed) {
+          throw new Error('Summary stream ended unexpectedly.');
+        }
+      }
+    })();
   </script>
 </body>
 </html>

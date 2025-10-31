@@ -6,8 +6,11 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import SimpleQueue
+from threading import Thread
+from typing import Callable
 
-from flask import Flask, render_template, request
+from flask import Flask, Response, render_template, request, stream_with_context
 
 from bqtools import (
     DEFAULT_SCOPES,
@@ -208,9 +211,8 @@ def _resolve_exports(
     raise ValueError("Selected date range is not supported yet.")
 
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    form_defaults = {
+def _load_form_defaults() -> dict[str, object]:
+    return {
         "dataset": _default_dataset(),
         "intraday_prefix": os.environ.get("BIGQUERY_INTRADAY_PREFIX", "events_intraday_"),
         "location": os.environ.get("BIGQUERY_LOCATION", ""),
@@ -224,16 +226,155 @@ def index():
         "week_days": _week_range_days(),
     }
 
+
+class ProgressTracker:
+    """Utility to normalise progress reporting for streaming responses."""
+
+    def __init__(
+        self,
+        total_units: int,
+        callback: Callable[[str, str, float], None] | None,
+    ) -> None:
+        self.total_units = max(total_units, 1)
+        self.callback = callback
+        self.completed_units = 0.0
+
+    def _emit(self, stage: str, message: str, units_offset: float) -> None:
+        if not self.callback:
+            return
+        units_offset = max(0.0, units_offset)
+        ratio = (self.completed_units + units_offset) / self.total_units
+        ratio = max(0.0, min(ratio, 1.0))
+        progress_value = 0.05 + 0.9 * ratio
+        progress_value = max(0.0, min(progress_value, 1.0))
+        self.callback(stage, message, progress_value)
+
+    def update(self, stage: str, message: str, offset: float = 0.0) -> None:
+        self._emit(stage, message, offset)
+
+    def complete_unit(self, stage: str, message: str) -> None:
+        self.completed_units = min(self.total_units, self.completed_units + 1)
+        self._emit(stage, message, 0.0)
+
+    @property
+    def current_progress(self) -> float:
+        ratio = self.completed_units / self.total_units
+        ratio = max(0.0, min(ratio, 1.0))
+        progress_value = 0.05 + 0.9 * ratio
+        return max(0.0, min(progress_value, 1.0))
+
+
+def build_summary_for_range(
+    selected_range: str,
+    form_defaults: dict[str, object],
+    options: DatasetSummaryOptions,
+    progress_callback: Callable[[str, str, float], None] | None = None,
+) -> tuple[dict, str | None]:
+    now = datetime.now(timezone.utc)
+    project_id, dataset_id = _split_dataset(str(form_defaults["dataset"]))
+    exports, range_label, summary_csv_path = _resolve_exports(
+        selected_range,
+        now=now,
+        project_id=project_id,
+        dataset_id=dataset_id,
+        week_days=int(form_defaults["week_days"]),
+    )
+
+    progress_callback and progress_callback("start", f"Preparing {range_label.lower()} request", 0.02)
+    total_units = len(exports) + (1 if selected_range.lower() == "last7days" else 0) + 1
+    tracker = ProgressTracker(total_units=total_units, callback=progress_callback)
+
+    location = str(form_defaults["location"]).strip() or None
+    bigquery_service: BigQueryService | None = None
+    notes: list[str] = []
+    csv_paths_for_summary: list[Path] = []
+
+    for export in exports:
+        csv_path = Path(export["csv_path"])
+        json_path = Path(export["json_path"])
+        full_table_id = str(export["full_table_id"])
+        csv_paths_for_summary.append(csv_path)
+
+        status_bits: list[str] = []
+        tracker.update("export", f"Checking local cache for {full_table_id}", 0.1)
+
+        needs_csv = not csv_path.exists()
+        if needs_csv:
+            tracker.update("export", f"Exporting {full_table_id} to CSV", 0.3)
+            if bigquery_service is None:
+                client = _build_client(
+                    credentials_file=str(form_defaults["credentials_file"]),
+                    scopes=DEFAULT_SCOPES,
+                    project_override=str(form_defaults["project"]) if form_defaults["project"] else None,
+                )
+                bigquery_service = BigQueryService(client)
+                progress_callback and progress_callback(
+                    "note", "Connected to BigQuery", tracker.current_progress
+                )
+            row_count = bigquery_service.export_table_to_csv(
+                full_table_id,
+                location=location,
+                output_path=csv_path,
+            )
+            status_bits.append(f"exported CSV {csv_path.name} ({row_count:,} rows)")
+            tracker.update("export", f"Downloaded {row_count:,} rows from {full_table_id}", 0.6)
+        else:
+            status_bits.append(f"reused CSV {csv_path.name}")
+            tracker.update("export", f"Reusing cached CSV for {full_table_id}", 0.4)
+
+        if not json_path.exists():
+            tracker.update("export", f"Building JSON cache for {full_table_id}", 0.85)
+            json_rows = _write_json_from_csv(csv_path, json_path)
+            status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
+        else:
+            status_bits.append(f"reused JSON {json_path.name}")
+
+        note = f"{full_table_id}: {'; '.join(status_bits)}."
+        notes.append(note)
+        tracker.complete_unit("export", f"Prepared data for {full_table_id}")
+        progress_callback and progress_callback("note", note, tracker.current_progress)
+
+    if selected_range.lower() == "last7days":
+        tracker.update("combine", "Combining daily exports", 0.3)
+        combined_rows = _combine_csv_files(csv_paths_for_summary, summary_csv_path)
+        combination_note = (
+            f"Combined {len(exports)}-day export into {summary_csv_path.name} ({combined_rows:,} rows)."
+        )
+        notes.append(combination_note)
+        tracker.complete_unit("combine", "Combined exports into summary CSV")
+        progress_callback and progress_callback("note", combination_note, tracker.current_progress)
+
+    os.environ["BIGQUERY_USE_CSV"] = "true"
+    os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
+
+    tracker.update("summary", "Generating dataset summary", 0.3)
+    service = DatasetSummaryService(None)
+    summary = service.build_summary(dataset=None, tables=[], options=options)
+    tracker.complete_unit("summary", f"Summary ready for {service.csv_path.name}")
+
+    summary_note = f"CSV mode active: summarising {service.csv_path.name}."
+    details = " ".join(notes)
+    filter_note = f"{range_label}: {details} {summary_note}" if details else f"{range_label}: {summary_note}"
+    progress_callback and progress_callback("note", summary_note, tracker.current_progress)
+    progress_callback and progress_callback("complete", "Summary generated successfully", 1.0)
+
+    return summary, filter_note
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    form_defaults = _load_form_defaults()
+
     summary: dict | None = None
     error_message: str | None = None
     filter_note: str | None = None
     selected_range = "today"
     summary_generated = False
     options = DatasetSummaryOptions(
-        location=form_defaults["location"] or None,
-        max_numeric_columns=max(0, form_defaults["max_numeric"]),
-        max_categorical_columns=max(0, form_defaults["max_categorical"]),
-        max_top_values=max(1, form_defaults["top_values"]),
+        location=(form_defaults["location"] or None),
+        max_numeric_columns=max(0, int(form_defaults["max_numeric"])),
+        max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
+        max_top_values=max(1, int(form_defaults["top_values"])),
     )
 
     if request.method == "POST":
@@ -249,71 +390,11 @@ def index():
                 summary_generated=False,
             )
         try:
-            now = datetime.now(timezone.utc)
-            project_id, dataset_id = _split_dataset(form_defaults["dataset"])
-            exports, range_label, summary_csv_path = _resolve_exports(
-                selected_range,
-                now=now,
-                project_id=project_id,
-                dataset_id=dataset_id,
-                week_days=form_defaults["week_days"],
+            summary, filter_note = build_summary_for_range(
+                selected_range=selected_range,
+                form_defaults=form_defaults,
+                options=options,
             )
-
-            location = form_defaults["location"] or None
-            bigquery_service: BigQueryService | None = None
-            notes: list[str] = []
-            csv_paths_for_summary: list[Path] = []
-
-            for export in exports:
-                csv_path = export["csv_path"]
-                json_path = export["json_path"]
-                full_table_id = export["full_table_id"]
-                csv_paths_for_summary.append(csv_path)
-
-                status_bits: list[str] = []
-                needs_csv = not csv_path.exists()
-                if needs_csv:
-                    if bigquery_service is None:
-                        client = _build_client(
-                            credentials_file=form_defaults["credentials_file"],
-                            scopes=DEFAULT_SCOPES,
-                            project_override=form_defaults["project"],
-                        )
-                        bigquery_service = BigQueryService(client)
-                    row_count = bigquery_service.export_table_to_csv(
-                        full_table_id,
-                        location=location,
-                        output_path=csv_path,
-                    )
-                    status_bits.append(f"exported CSV {csv_path.name} ({row_count:,} rows)")
-                else:
-                    status_bits.append(f"reused CSV {csv_path.name}")
-
-                if not json_path.exists():
-                    json_rows = _write_json_from_csv(csv_path, json_path)
-                    status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
-                else:
-                    status_bits.append(f"reused JSON {json_path.name}")
-
-                notes.append(f"{full_table_id}: {'; '.join(status_bits)}.")
-
-            if selected_range == "last7days":
-                combined_rows = _combine_csv_files(csv_paths_for_summary, summary_csv_path)
-                notes.append(
-                    f"Combined {len(exports)}-day export into {summary_csv_path.name} ({combined_rows:,} rows)."
-                )
-
-            os.environ["BIGQUERY_USE_CSV"] = "true"
-            os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
-
-            service = DatasetSummaryService(None)
-            summary = service.build_summary(dataset=None, tables=[], options=options)
-            summary_note = f"CSV mode active: summarising {service.csv_path.name}."
-            details = " ".join(notes)
-            if details:
-                filter_note = f"{range_label}: {details} {summary_note}"
-            else:
-                filter_note = f"{range_label}: {summary_note}"
             summary_generated = True
         except IntradayTableNotFound as exc:
             error_message = f"{exc} Hint: try another --intraday-date or tick 'All tables'."
@@ -335,6 +416,81 @@ def index():
         selected_date_range=selected_range,
         summary_generated=summary_generated,
     )
+
+
+@app.post("/api/progress-summary")
+def progress_summary() -> Response:
+    payload = request.get_json(silent=True) or {}
+    selected_range = str(payload.get("date_range") or "today").lower()
+    form_defaults = _load_form_defaults()
+    options = DatasetSummaryOptions(
+        location=(form_defaults["location"] or None),
+        max_numeric_columns=max(0, int(form_defaults["max_numeric"])),
+        max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
+        max_top_values=max(1, int(form_defaults["top_values"])),
+    )
+
+    event_queue: SimpleQueue[dict | None] = SimpleQueue()
+
+    def enqueue(event: dict | None) -> None:
+        event_queue.put(event)
+
+    def progress_cb(stage: str, message: str, progress_value: float) -> None:
+        if stage == "note":
+            enqueue({"type": "note", "message": message, "progress": progress_value})
+        else:
+            enqueue(
+                {
+                    "type": "status",
+                    "stage": stage,
+                    "message": message,
+                    "progress": progress_value,
+                }
+            )
+
+    def worker() -> None:
+        try:
+            with app.app_context():
+                summary, filter_note = build_summary_for_range(
+                    selected_range=selected_range,
+                    form_defaults=form_defaults,
+                    options=options,
+                    progress_callback=progress_cb,
+                )
+                summary_html = render_template(
+                    "summary_content.html",
+                    summary=summary,
+                    filter_note=filter_note,
+                    error_message=None,
+                    summary_generated=True,
+                    selected_date_range=selected_range,
+                    form=form_defaults,
+                )
+            enqueue({"type": "complete", "html": summary_html})
+        except IntradayTableNotFound as exc:
+            enqueue({"type": "error", "message": f"{exc} Hint: try another date range or enable all tables."})
+        except FileNotFoundError as exc:
+            enqueue({"type": "error", "message": f"Credentials file error: {exc}"})
+        except ValueError as exc:
+            enqueue({"type": "error", "message": str(exc)})
+        except BaseCloudError as exc:
+            enqueue({"type": "error", "message": f"BigQuery request failed: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            enqueue({"type": "error", "message": f"Unexpected error: {exc}"})
+        finally:
+            enqueue(None)
+
+    Thread(target=worker, daemon=True).start()
+
+    @stream_with_context
+    def stream():
+        while True:
+            event = event_queue.get()
+            if event is None:
+                break
+            yield json.dumps(event) + "\n"
+
+    return Response(stream(), mimetype="application/x-ndjson")
 
 
 if __name__ == "__main__":
