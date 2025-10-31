@@ -6,11 +6,10 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 2rem; }
     h1 { margin-bottom: 0.5rem; }
-    form { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; }
-    label { display: block; margin-bottom: 0.5rem; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 0.4rem; margin-top: 0.2rem; }
-    .inline { display: flex; gap: 1rem; }
-    .inline > div { flex: 1; }
+    form { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
+    .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 200px; }
+    .form-field label { font-weight: bold; margin-bottom: 0; }
+    select { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
     th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; vertical-align: top; }
     th { background-color: #f0f0f0; }
@@ -47,82 +46,21 @@
   {% endif %}
 
   <form method="post">
-    <div class="inline">
-      <div>
-        <label>
-          Dataset
-          <input type="text" name="dataset" value="{{ form.dataset }}">
-        </label>
-      </div>
-      <div>
-        <label>
-          Project override (optional)
-          <input type="text" name="project" value="{{ form.project or '' }}">
-        </label>
-      </div>
+    <div class="form-field">
+      <label for="date_range">Date range</label>
+      <select id="date_range" name="date_range">
+        <option value="today" {% if selected_date_range == 'today' %}selected{% endif %}>Today</option>
+        <option value="yesterday" {% if selected_date_range == 'yesterday' %}selected{% endif %}>Yesterday</option>
+        {% set week_days = form.week_days or 7 %}
+        <option value="last7days" {% if selected_date_range == 'last7days' %}selected{% endif %}>
+          Last {{ week_days }} day{% if week_days != 1 %}s{% endif %}
+        </option>
+      </select>
     </div>
-
-    <div class="inline">
-      <div>
-        <label>
-          Credentials file
-          <input type="text" name="credentials_file" value="{{ form.credentials_file }}">
-        </label>
-      </div>
-      <div>
-        <label>
-          Location hint (optional)
-          <input type="text" name="location" value="{{ form.location }}">
-        </label>
-      </div>
-    </div>
-
-    <div class="inline">
-      <div>
-        <label>
-          Intraday date (YYYYMMDD)
-          <input type="text" name="intraday_date" value="{{ form.intraday_date }}">
-        </label>
-      </div>
-      <div>
-        <label>
-          Intraday table prefix
-          <input type="text" name="intraday_prefix" value="{{ form.intraday_prefix }}">
-        </label>
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <label>
-          <input type="checkbox" name="all_tables" {% if form.all_tables %}checked{% endif %}>
-          Include all tables
-        </label>
-      </div>
-    </div>
-
-    <div class="inline">
-      <div>
-        <label>
-          Max numeric/date columns
-          <input type="number" name="max_numeric" min="0" value="{{ form.max_numeric }}">
-        </label>
-      </div>
-      <div>
-        <label>
-          Max categorical columns
-          <input type="number" name="max_categorical" min="0" value="{{ form.max_categorical }}">
-        </label>
-      </div>
-      <div>
-        <label>
-          Top values per column
-          <input type="number" name="top_values" min="1" value="{{ form.top_values }}">
-        </label>
-      </div>
-    </div>
-
-    <button type="submit">Generate summary</button>
+    <button type="submit" name="action" value="generate">Generate summary</button>
   </form>
 
-  {% if summary %}
+  {% if summary_generated and summary %}
     {% if summary.mode == 'csv' %}
       <section>
         <p><strong>Rows analysed:</strong> {{ summary.ga4_summary.total_events }} | <strong>Sections:</strong> {{ summary.dataset.table_count }}</p>
@@ -130,7 +68,7 @@
 
       {% for section in summary.csv_sections %}
         {% set section_id = "csv-section-" ~ loop.index0 %}
-        {% set display_limit = 2 %}
+        {% set display_limit = 10 %}
         {% set total_rows = section.rows|length %}
         <section>
           <h2>{{ section.title }}</h2>

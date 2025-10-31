@@ -28,6 +28,7 @@ class GA4IntradaySummary:
     login_status: Counter[str]
     conversions: int
     conversion_rate: float | None
+    report_end_date: datetime | None = None
 
 
 def generate_ga4_intraday_summary(csv_path: Path, options: DatasetSummaryOptions) -> tuple[GA4IntradaySummary, str]:
@@ -74,11 +75,18 @@ def generate_ga4_intraday_summary(csv_path: Path, options: DatasetSummaryOptions
         if row.event_name.lower() == "purchase":
             conversions += 1
 
-    report_date = datetime.strptime(rows[0].event_date, "%Y%m%d")
+    date_tokens = sorted({row.event_date for row in rows if row.event_date})
+    if date_tokens:
+        report_start = datetime.strptime(date_tokens[0], "%Y%m%d")
+        report_end = datetime.strptime(date_tokens[-1], "%Y%m%d")
+    else:
+        report_start = datetime.now()
+        report_end = report_start
     unique_sessions_count = len(sessions)
     conversion_rate = conversions / unique_sessions_count if unique_sessions_count else None
     summary = GA4IntradaySummary(
-        report_date=report_date,
+        report_date=report_start,
+        report_end_date=report_end if report_end != report_start else None,
         total_events=total_events,
         unique_users=len(users),
         unique_sessions=unique_sessions_count,
@@ -101,7 +109,13 @@ def generate_ga4_intraday_summary(csv_path: Path, options: DatasetSummaryOptions
 
 def _render_report(summary: GA4IntradaySummary, options: DatasetSummaryOptions) -> str:
     lines: list[str] = []
-    date_str = summary.report_date.strftime("%d %b %Y")
+    if summary.report_end_date and summary.report_end_date != summary.report_date:
+        date_str = (
+            f"{summary.report_date.strftime('%d %b %Y')} – "
+            f"{summary.report_end_date.strftime('%d %b %Y')}"
+        )
+    else:
+        date_str = summary.report_date.strftime("%d %b %Y")
     lines.append(f"GA4 Intraday Event Overview — {date_str}")
     lines.append("=")
     lines.append("")
