@@ -9,7 +9,11 @@
     form { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
     .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 200px; }
     .form-field label { font-weight: bold; margin-bottom: 0; }
-    select { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
+    .form-field small { color: #555; font-size: 0.85rem; }
+    .form-field--checkbox { flex-direction: column; align-items: flex-start; }
+    .form-field--checkbox label { font-weight: 600; display: inline-flex; align-items: center; gap: 0.35rem; }
+    .form-field--checkbox input[type="checkbox"] { margin: 0; }
+    select, input[type="date"] { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
     th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; vertical-align: top; }
     th { background-color: #f0f0f0; }
@@ -63,6 +67,30 @@
           Last {{ week_days }} day{% if week_days != 1 %}s{% endif %}
         </option>
       </select>
+    </div>
+    <div class="form-field">
+      <label for="custom_date">Specific date</label>
+      <input
+        type="date"
+        id="custom_date"
+        name="custom_date"
+        value="{% if selected_specific_date %}{{ selected_specific_date }}{% endif %}"
+        max="{{ current_date }}"
+        aria-describedby="custom-date-hint"
+      />
+      <small id="custom-date-hint">Leave blank to use the date range above.</small>
+    </div>
+    <div class="form-field form-field--checkbox">
+      <label for="force_refresh">
+        <input
+          type="checkbox"
+          id="force_refresh"
+          name="force_refresh"
+          {% if force_refresh_checked %}checked{% endif %}
+        />
+        Force refresh
+      </label>
+      <small>Skip cached summaries and pull fresh data when selected.</small>
     </div>
     <button type="submit" name="action" value="generate">Generate summary</button>
   </form>
@@ -129,22 +157,69 @@
       var progressSteps = document.getElementById('progress-steps');
       var summaryOutput = document.getElementById('summary-output');
       var errorContainer = document.getElementById('error-container');
+      var dateRangeSelect = form.querySelector('#date_range');
+      var customDateInput = form.querySelector('#custom_date');
+      var forceRefreshInput = form.querySelector('#force_refresh');
 
       form.addEventListener('submit', function (event) {
         event.preventDefault();
+        var specificDate = customDateInput && customDateInput.value ? customDateInput.value : '';
+        var rangeValue = specificDate ? 'date:' + specificDate : (dateRangeSelect ? dateRangeSelect.value : 'today');
+        var forceRefresh = forceRefreshInput && forceRefreshInput.checked;
+        startSummaryRequest(
+          {
+            date_range: rangeValue,
+            custom_date: specificDate || undefined,
+            force_refresh: forceRefresh
+          },
+          {
+            checkAvailability: !forceRefresh && Boolean(specificDate),
+            forceRefresh: forceRefresh
+          }
+        );
+      });
+
+      async function startSummaryRequest(payload, options) {
+        var opts = options || {};
+        var specificDate = payload && payload.custom_date ? String(payload.custom_date) : '';
+        var forceRefresh = Boolean(opts.forceRefresh);
+        errorContainer.innerHTML = '';
+        var availability;
+
+        if (forceRefresh) {
+          payload.force_refresh = true;
+        }
+
+        if (!forceRefresh && specificDate && opts.checkAvailability !== false) {
+          try {
+            availability = await checkSummaryAvailability(specificDate);
+          } catch (availabilityError) {
+            showError(
+              availabilityError && availabilityError.message
+                ? availabilityError.message
+                : 'Unable to verify summary availability.'
+            );
+            return;
+          }
+          if (availability && availability.range_key) {
+            payload.date_range = availability.range_key;
+          }
+          if (!availability || availability.available !== true) {
+            var confirmMessage = 'No cached summary found for ' + specificDate + '. Connect to BigQuery and fetch it now?';
+            var shouldProceed = window.confirm(confirmMessage);
+            if (!shouldProceed) {
+              return;
+            }
+          }
+        }
+
         if (submitButton) {
           submitButton.disabled = true;
         }
-        errorContainer.innerHTML = '';
         progressSteps.innerHTML = '';
         progressPanel.hidden = false;
         summaryOutput.classList.add('is-loading');
         updateProgress(0.02, 'Preparing summary request…');
-
-        var rangeSelect = form.querySelector('#date_range');
-        var payload = {
-          date_range: rangeSelect ? rangeSelect.value : 'today'
-        };
 
         fetchSummary(payload)
           .catch(function (error) {
@@ -156,7 +231,33 @@
               submitButton.disabled = false;
             }
           });
-      });
+      }
+
+      async function checkSummaryAvailability(dateValue) {
+        var response;
+        try {
+          response = await fetch('/api/check-summary', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: dateValue })
+          });
+        } catch (networkError) {
+          throw new Error('Network error while checking summary availability.');
+        }
+
+        var payload = null;
+        try {
+          payload = await response.json();
+        } catch (parseError) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          var message = payload && payload.error ? payload.error : 'Failed to check summary availability.';
+          throw new Error(message);
+        }
+        return payload || {};
+      }
 
       function updateProgress(progressValue, message) {
         var value = Math.max(0, Math.min(progressValue || 0, 1));
