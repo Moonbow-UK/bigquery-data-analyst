@@ -31,13 +31,12 @@ from bqtools import (
 from bqtools.api import SummaryAPIConfig, create_summary_blueprint
 from bqtools.config import default_credentials_file, load_environment
 from bqtools.services.dataset_summary import BaseCloudError
-from db import (
+from bqtools.services.persistence import (
     Dataset,
+    PersistenceService,
     SummaryExport,
     SummaryJob,
     SummaryReport,
-    get_session,
-    is_configured,
 )
 
 load_environment()
@@ -70,6 +69,8 @@ if not logger.handlers:
     )
     logger.addHandler(stream_handler)
 logger.propagate = False
+
+persistence_service = PersistenceService(logger=logger.getChild("persistence"))
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -167,6 +168,20 @@ def _jsonify(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonify(item) for item in value]
     return str(value)
+
+
+def _use_database_persistence() -> bool:
+    return persistence_service.is_database_mode()
+
+
+def _enter_csv_mode(summary_csv_path: Path) -> None:
+    os.environ["BIGQUERY_USE_CSV"] = "true"
+    os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
+
+
+def _exit_csv_mode() -> None:
+    os.environ.pop("BIGQUERY_USE_CSV", None)
+    os.environ.pop("BIGQUERY_USE_CSV_FILE", None)
 
 
 def _write_json_from_csv(csv_path: Path, json_path: Path) -> int:
@@ -350,12 +365,15 @@ def build_summary_for_range(
         dataset_id=dataset_id,
         week_days=int(form_defaults["week_days"]),
     )
+    persistence_mode = persistence_service.mode
+    db_enabled = db_session is not None and persistence_mode == "DB"
     logger.info(
-        "Summary run started for %s.%s range=%s exports=%d",
+        "Summary run started for %s.%s range=%s exports=%d mode=%s",
         project_id,
         dataset_id,
         normalized_range,
         len(exports),
+        persistence_mode,
     )
 
     location = str(form_defaults["location"]).strip() or None
@@ -369,21 +387,21 @@ def build_summary_for_range(
     dataset_record: Dataset | None = None
 
     def emit(stage: str, message: str, progress_value: float) -> None:
-        if job_record and isinstance(job_record, SummaryJob) and db_session is not None and stage != "complete":
+        if db_enabled and job_record and stage != "complete":
             try:
                 job_record.progress = float(progress_value)
                 if job_record.status != "running":
                     job_record.status = "running"
-                db_session.add(job_record)
-                db_session.commit()
+                db_session.add(job_record)  # type: ignore[union-attr]
+                db_session.commit()  # type: ignore[union-attr]
             except SQLAlchemyError:
-                db_session.rollback()
+                db_session.rollback()  # type: ignore[union-attr]
                 raise
         if external_progress_callback:
             external_progress_callback(stage, message, progress_value)
 
     try:
-        if db_session is not None:
+        if db_enabled and db_session is not None:
             dataset_stmt = select(Dataset).where(
                 Dataset.project_id == project_id,
                 Dataset.dataset_id == dataset_id,
@@ -465,7 +483,7 @@ def build_summary_for_range(
             json_rows: int | None = None
             export_record: SummaryExport | None = None
 
-            if db_session is not None and job_record is not None:
+            if db_enabled and db_session is not None and job_record is not None:
                 export_record = SummaryExport(
                     job_id=job_record.id,
                     table_name=table_name,
@@ -511,7 +529,7 @@ def build_summary_for_range(
             note = f"{full_table_id}: {'; '.join(status_bits)}."
             notes.append(note)
 
-            if export_record is not None and db_session is not None:
+            if db_enabled and export_record is not None and db_session is not None:
                 export_record.reused_cache = not needs_csv
                 export_record.csv_row_count = csv_rows
                 export_record.json_row_count = json_rows
@@ -545,9 +563,9 @@ def build_summary_for_range(
                 combined_rows,
             )
 
-        os.environ["BIGQUERY_USE_CSV"] = "true"
-        os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
-
+        if persistence_mode == "DB":
+            _exit_csv_mode()
+        _enter_csv_mode(summary_csv_path)
         tracker.update("summary", "Generating dataset summary", 0.3)
         service = DatasetSummaryService(None)
         summary = service.build_summary(dataset=None, tables=[], options=options)
@@ -559,7 +577,7 @@ def build_summary_for_range(
             f"{range_label}: {details} {summary_note}" if details else f"{range_label}: {summary_note}"
         )
 
-        if db_session is not None and job_record is not None:
+        if db_enabled and db_session is not None and job_record is not None:
             ga4_summary = summary.get("ga4_summary") or {}
             total_events_value = ga4_summary.get("total_events")
             if isinstance(total_events_value, (int, float, Decimal)):
@@ -597,7 +615,7 @@ def build_summary_for_range(
 
         return summary, filter_note
     except Exception as exc:
-        if db_session is not None and job_record is not None:
+        if db_enabled and db_session is not None and job_record is not None:
             job_record.status = "failed"
             job_record.error_message = str(exc)
             job_record.finished_at = _now_utc()
@@ -614,6 +632,8 @@ def build_summary_for_range(
             exc,
         )
         raise
+    finally:
+        _exit_csv_mode()
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -635,14 +655,14 @@ def index():
     )
 
     try:
-        if is_configured():
+        if _use_database_persistence():
             try:
-                db_session = get_session()
+                db_session = persistence_service.get_session()
             except Exception as exc:  # noqa: BLE001
                 db_error = f"Database connection failed: {exc}"
                 logger.error(db_error)
         else:
-            logger.debug("DATABASE_URL not set; running without persistence.")
+            logger.debug("Persistence mode CSV; skipping database session acquisition.")
 
         if request.method == "POST":
             selected_range = request.form.get("date_range", "today").lower()
@@ -664,7 +684,7 @@ def index():
                         selected_range=selected_range,
                         form_defaults=form_defaults,
                         options=options,
-                        db_session=db_session,
+                        db_session=db_session if _use_database_persistence() else None,
                     )
                     summary_generated = True
                 except IntradayTableNotFound as exc:
@@ -736,9 +756,9 @@ def progress_summary() -> Response:
         try:
             with app.app_context():
                 logger.info("Worker started for range=%s", selected_range)
-                if is_configured():
+                if _use_database_persistence():
                     try:
-                        session = get_session()
+                        session = persistence_service.get_session()
                     except Exception as exc:  # noqa: BLE001
                         enqueue({"type": "error", "message": f"Database connection failed: {exc}"})
                         logger.error("Worker failed to acquire DB session: %s", exc)
@@ -748,7 +768,7 @@ def progress_summary() -> Response:
                     form_defaults=form_defaults,
                     options=options,
                     progress_callback=progress_cb,
-                    db_session=session,
+                    db_session=session if _use_database_persistence() else None,
                 )
                 summary_html = render_template(
                     "summary_content.html",
