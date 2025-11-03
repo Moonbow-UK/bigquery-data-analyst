@@ -9,7 +9,7 @@ import os
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from queue import SimpleQueue
@@ -69,10 +69,86 @@ if not logger.handlers:
     stream_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
     )
-    logger.addHandler(stream_handler)
+logger.addHandler(stream_handler)
 logger.propagate = False
 
 persistence_service = PersistenceService(logger=logger.getChild("persistence"))
+
+
+def _coerce_positive_int(value: Any, default: int = 1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            coerced = int(value)
+        except (OverflowError, ValueError):
+            return default
+        return coerced if coerced > 0 else default
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            coerced = int(Decimal(text))
+        except (ValueError, ArithmeticError, DecimalException):
+            return default
+        return coerced if coerced > 0 else default
+    return default
+
+
+def _compute_product_purchase_stats(csv_paths: list[Path], top_n: int = 10) -> dict[str, list[dict[str, object]]]:
+    counts: Counter[str] = Counter()
+    for csv_path in csv_paths:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                reader = csv.DictReader(csv_file)
+                if not reader.fieldnames:
+                    continue
+                for row in reader:
+                    event_name = (row.get("event_name") or "").strip().lower()
+                    if event_name != "purchase":
+                        continue
+                    items_payload = row.get("items")
+                    if not items_payload:
+                        continue
+                    try:
+                        parsed_items = json.loads(items_payload)
+                    except json.JSONDecodeError:
+                        logger.debug("Failed to parse items payload for %s", csv_path)
+                        continue
+                    if not isinstance(parsed_items, list):
+                        continue
+                    for item in parsed_items:
+                        if not isinstance(item, dict):
+                            continue
+                        name = (
+                            item.get("item_name")
+                            or item.get("item_id")
+                            or item.get("item_brand")
+                            or "Unknown product"
+                        )
+                        name_str = str(name).strip() or "Unknown product"
+                        quantity = _coerce_positive_int(item.get("quantity"), default=1)
+                        counts[name_str] += quantity
+        except FileNotFoundError:
+            logger.debug("CSV path missing during product stats computation: %s", csv_path)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to compute product stats from %s: %s", csv_path, exc)
+
+    if not counts:
+        return {"most_purchased": [], "least_purchased": []}
+
+    most = [
+        {"name": name, "count": count}
+        for name, count in counts.most_common(top_n)
+    ]
+
+    least_sorted = sorted(counts.items(), key=lambda item: (item[1], item[0]))
+    least = [{"name": name, "count": count} for name, count in least_sorted[:top_n]]
+    return {"most_purchased": most, "least_purchased": least}
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -992,6 +1068,9 @@ def build_summary_for_range(
         filter_note = (
             f"{range_label}: {details} {summary_note}" if details else f"{range_label}: {summary_note}"
         )
+
+        product_purchase_stats = _compute_product_purchase_stats(csv_paths_for_summary)
+        summary["product_purchase_stats"] = product_purchase_stats
 
         if summary.get("intraday_active"):
             if latest_export_timestamp is None:
