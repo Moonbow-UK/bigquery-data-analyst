@@ -150,6 +150,11 @@ def _table_kind_from_name(table_name: str) -> str:
     return "unknown"
 
 
+_INTRADAY_HINT_MESSAGE = (
+    "Daily GA4 table not yet published; using intraday snapshot. Run the summary again once the final table is available."
+)
+
+
 def _is_not_found_error(error: BaseCloudError) -> bool:
     if isinstance(error, gcloud_exceptions.NotFound):
         return True
@@ -158,6 +163,15 @@ def _is_not_found_error(error: BaseCloudError) -> bool:
         return True
     message = getattr(error, "message", "") or str(error)
     return "not found" in message.lower()
+
+
+def _intraday_hint(summary: dict | None, fallback_flag: bool | None = None) -> str:
+    is_intraday = False
+    if summary and isinstance(summary, dict):
+        is_intraday = bool(summary.get("intraday_active"))
+    if fallback_flag is not None:
+        is_intraday = is_intraday or bool(fallback_flag)
+    return _INTRADAY_HINT_MESSAGE if is_intraday else ""
 
 
 def _jsonify(value: Any) -> Any:
@@ -434,6 +448,11 @@ def _assemble_summary_from_report(artifacts: CachedSummaryArtifacts) -> CachedSu
         summary_data["dataset"] = report.dataset_snapshot
     if "csv_sections" not in summary_data:
         summary_data["csv_sections"] = []
+
+    intraday_flag = bool(summary_data.get("intraday_active"))
+    if not intraday_flag:
+        intraday_flag = bool(getattr(artifacts.job, "intraday_active", False))
+    summary_data["intraday_active"] = intraday_flag
 
     if not summary_data:
         return None
@@ -857,6 +876,8 @@ def build_summary_for_range(
         tracker.update("summary", "Generating dataset summary", 0.3)
         service = DatasetSummaryService(None)
         summary = service.build_summary(dataset=None, tables=[], options=options)
+        if isinstance(summary, dict):
+            summary["intraday_active"] = intraday_fallback_detected
         tracker.complete_unit("summary", f"Summary ready for {service.csv_path.name}")
 
         summary_note = f"CSV mode active: summarising {service.csv_path.name}."
@@ -950,9 +971,11 @@ def index():
         max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
         max_top_values=max(1, int(form_defaults["top_values"])),
     )
+    debug_mode = _env_bool("DEBUG_MODE", False)
     selected_specific_date = ""
     current_date_iso = _now_utc().date().isoformat()
     force_refresh_checked = False
+    intraday_hint = ""
 
     try:
         if _use_database_persistence():
@@ -987,6 +1010,8 @@ def index():
                     current_date=current_date_iso,
                     force_refresh_checked=force_refresh_checked,
                     summary_generated=False,
+                    debug_mode=debug_mode,
+                    intraday_hint=intraday_hint,
                 )
             if db_error and db_session is None:
                 error_message = db_error
@@ -1026,6 +1051,13 @@ def index():
                             db_session=db_session if _use_database_persistence() else None,
                         )
                         summary_generated = True
+                    if summary_generated:
+                        fallback_flag = (
+                            cached_result.job.intraday_active
+                            if cached_result is not None and cached_result.job is not None
+                            else None
+                        )
+                        intraday_hint = _intraday_hint(summary, fallback_flag)
                 except IntradayTableNotFound as exc:
                     error_message = f"{exc} Hint: try another --intraday-date or tick 'All tables'."
                     logger.warning(error_message)
@@ -1059,6 +1091,8 @@ def index():
             current_date=current_date_iso,
             force_refresh_checked=force_refresh_checked,
             summary_generated=summary_generated,
+            debug_mode=debug_mode,
+            intraday_hint=intraday_hint,
         )
     finally:
         if db_session is not None:
@@ -1148,6 +1182,7 @@ def progress_summary() -> Response:
         max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
         max_top_values=max(1, int(form_defaults["top_values"])),
     )
+    debug_mode = _env_bool("DEBUG_MODE", False)
 
     event_queue: SimpleQueue[dict | None] = SimpleQueue()
 
@@ -1208,6 +1243,10 @@ def progress_summary() -> Response:
                                     "progress": 0.65,
                                 }
                             )
+                            intraday_hint_value = _intraday_hint(
+                                cached_result.summary,
+                                cached_result.job.intraday_active if cached_result.job else None,
+                            )
                             summary_html = render_template(
                                 "summary_content.html",
                                 summary=cached_result.summary,
@@ -1216,6 +1255,8 @@ def progress_summary() -> Response:
                                 summary_generated=True,
                                 selected_date_range=selected_range,
                                 form=form_defaults,
+                                debug_mode=debug_mode,
+                                intraday_hint=intraday_hint_value,
                             )
                             enqueue(
                                 {
@@ -1225,7 +1266,7 @@ def progress_summary() -> Response:
                                     "progress": 0.95,
                                 }
                             )
-                            enqueue({"type": "complete", "html": summary_html})
+                            enqueue({"type": "complete", "html": summary_html, "hint": intraday_hint_value})
                             logger.info(
                                 "Worker reused cached summary for %s.%s range=%s job=%s",
                                 project_id,
@@ -1241,6 +1282,7 @@ def progress_summary() -> Response:
                     progress_callback=progress_cb,
                     db_session=session if _use_database_persistence() else None,
                 )
+                intraday_hint_value = _intraday_hint(summary)
                 summary_html = render_template(
                     "summary_content.html",
                     summary=summary,
@@ -1249,8 +1291,10 @@ def progress_summary() -> Response:
                     summary_generated=True,
                     selected_date_range=selected_range,
                     form=form_defaults,
+                    debug_mode=debug_mode,
+                    intraday_hint=intraday_hint_value,
                 )
-            enqueue({"type": "complete", "html": summary_html})
+            enqueue({"type": "complete", "html": summary_html, "hint": intraday_hint_value})
         except IntradayTableNotFound as exc:
             enqueue({"type": "error", "message": f"{exc} Hint: try another date range or enable all tables."})
         except FileNotFoundError as exc:
