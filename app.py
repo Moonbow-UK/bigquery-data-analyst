@@ -141,6 +141,48 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _format_elapsed_label(timestamp: datetime, *, reference: datetime | None = None) -> str:
+    base = reference or _now_utc()
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    else:
+        base = base.astimezone(timezone.utc)
+
+    seconds_total = int((base - timestamp).total_seconds())
+    if seconds_total < 0:
+        seconds_total = 0
+    if seconds_total < 60:
+        return f"{seconds_total}s ago"
+    minutes, seconds = divmod(seconds_total, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes:02d}m ago"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h ago"
+
+
 def _table_kind_from_name(table_name: str) -> str:
     lowered = table_name.lower()
     if "intraday" in lowered:
@@ -390,6 +432,21 @@ class CachedSummaryResult:
     report: SummaryReport
 
 
+def _resolve_intraday_timestamp_payload(
+    summary: dict[str, Any] | None,
+    *,
+    job: SummaryJob | None = None,
+) -> tuple[str | None, str | None]:
+    if not summary or not summary.get("intraday_active"):
+        return None, None
+    timestamp = _parse_timestamp(summary.get("intraday_last_updated_at"))
+    if timestamp is None and job is not None:
+        timestamp = _parse_timestamp(getattr(job, "finished_at", None))
+    if timestamp is None:
+        timestamp = _now_utc()
+    return timestamp.isoformat(timespec="seconds"), _format_elapsed_label(timestamp)
+
+
 def _coerce_truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -453,6 +510,10 @@ def _assemble_summary_from_report(artifacts: CachedSummaryArtifacts) -> CachedSu
     if not intraday_flag:
         intraday_flag = bool(getattr(artifacts.job, "intraday_active", False))
     summary_data["intraday_active"] = intraday_flag
+    if intraday_flag and "intraday_last_updated_at" not in summary_data:
+        finished_at = _parse_timestamp(getattr(artifacts.job, "finished_at", None))
+        if finished_at is not None:
+            summary_data["intraday_last_updated_at"] = finished_at.isoformat(timespec="seconds")
 
     if not summary_data:
         return None
@@ -664,6 +725,7 @@ def build_summary_for_range(
         bigquery_service: BigQueryService | None = None
         notes: list[str] = []
         csv_paths_for_summary: list[Path] = []
+        latest_export_timestamp: datetime | None = None
         intraday_fallback_detected = False
 
         for export in exports:
@@ -799,6 +861,13 @@ def build_summary_for_range(
             else:
                 status_bits.append(f"reused JSON {json_path.name}")
 
+            try:
+                candidate_timestamp = datetime.fromtimestamp(csv_path.stat().st_mtime, tz=timezone.utc)
+                if latest_export_timestamp is None or candidate_timestamp > latest_export_timestamp:
+                    latest_export_timestamp = candidate_timestamp
+            except FileNotFoundError:
+                pass
+
             if using_fallback and export.get("fallback_table_name"):
                 status_bits.append("daily table missing; using intraday snapshot")
                 intraday_fallback_detected = True
@@ -885,6 +954,18 @@ def build_summary_for_range(
         filter_note = (
             f"{range_label}: {details} {summary_note}" if details else f"{range_label}: {summary_note}"
         )
+
+        if summary.get("intraday_active"):
+            if latest_export_timestamp is None:
+                for candidate_path in csv_paths_for_summary:
+                    try:
+                        candidate_ts = datetime.fromtimestamp(candidate_path.stat().st_mtime, tz=timezone.utc)
+                    except FileNotFoundError:
+                        continue
+                    if latest_export_timestamp is None or candidate_ts > latest_export_timestamp:
+                        latest_export_timestamp = candidate_ts
+            timestamp_value = latest_export_timestamp or _now_utc()
+            summary.setdefault("intraday_last_updated_at", timestamp_value.isoformat(timespec="seconds"))
 
         if db_enabled and db_session is not None and job_record is not None:
             job_record.intraday_active = intraday_fallback_detected
@@ -976,6 +1057,8 @@ def index():
     current_date_iso = _now_utc().date().isoformat()
     force_refresh_checked = False
     intraday_hint = ""
+    intraday_last_updated: str | None = None
+    intraday_last_updated_label: str | None = None
 
     try:
         if _use_database_persistence():
@@ -1012,6 +1095,8 @@ def index():
                     summary_generated=False,
                     debug_mode=debug_mode,
                     intraday_hint=intraday_hint,
+                    intraday_last_updated=intraday_last_updated,
+                    intraday_last_updated_label=intraday_last_updated_label,
                 )
             if db_error and db_session is None:
                 error_message = db_error
@@ -1058,6 +1143,10 @@ def index():
                             else None
                         )
                         intraday_hint = _intraday_hint(summary, fallback_flag)
+                        intraday_last_updated, intraday_last_updated_label = _resolve_intraday_timestamp_payload(
+                            summary,
+                            job=cached_result.job if cached_result is not None else None,
+                        )
                 except IntradayTableNotFound as exc:
                     error_message = f"{exc} Hint: try another --intraday-date or tick 'All tables'."
                     logger.warning(error_message)
@@ -1093,6 +1182,8 @@ def index():
             summary_generated=summary_generated,
             debug_mode=debug_mode,
             intraday_hint=intraday_hint,
+            intraday_last_updated=intraday_last_updated,
+            intraday_last_updated_label=intraday_last_updated_label,
         )
     finally:
         if db_session is not None:
@@ -1247,6 +1338,13 @@ def progress_summary() -> Response:
                                 cached_result.summary,
                                 cached_result.job.intraday_active if cached_result.job else None,
                             )
+                            (
+                                intraday_last_updated_value,
+                                intraday_last_updated_label,
+                            ) = _resolve_intraday_timestamp_payload(
+                                cached_result.summary,
+                                job=cached_result.job,
+                            )
                             summary_html = render_template(
                                 "summary_content.html",
                                 summary=cached_result.summary,
@@ -1257,6 +1355,8 @@ def progress_summary() -> Response:
                                 form=form_defaults,
                                 debug_mode=debug_mode,
                                 intraday_hint=intraday_hint_value,
+                                intraday_last_updated=intraday_last_updated_value,
+                                intraday_last_updated_label=intraday_last_updated_label,
                             )
                             enqueue(
                                 {
@@ -1266,7 +1366,15 @@ def progress_summary() -> Response:
                                     "progress": 0.95,
                                 }
                             )
-                            enqueue({"type": "complete", "html": summary_html, "hint": intraday_hint_value})
+                            enqueue(
+                                {
+                                    "type": "complete",
+                                    "html": summary_html,
+                                    "hint": intraday_hint_value,
+                                    "intraday_last_updated": intraday_last_updated_value,
+                                    "intraday_last_updated_label": intraday_last_updated_label,
+                                }
+                            )
                             logger.info(
                                 "Worker reused cached summary for %s.%s range=%s job=%s",
                                 project_id,
@@ -1283,6 +1391,10 @@ def progress_summary() -> Response:
                     db_session=session if _use_database_persistence() else None,
                 )
                 intraday_hint_value = _intraday_hint(summary)
+                (
+                    intraday_last_updated_value,
+                    intraday_last_updated_label,
+                ) = _resolve_intraday_timestamp_payload(summary)
                 summary_html = render_template(
                     "summary_content.html",
                     summary=summary,
@@ -1293,8 +1405,18 @@ def progress_summary() -> Response:
                     form=form_defaults,
                     debug_mode=debug_mode,
                     intraday_hint=intraday_hint_value,
+                    intraday_last_updated=intraday_last_updated_value,
+                    intraday_last_updated_label=intraday_last_updated_label,
                 )
-            enqueue({"type": "complete", "html": summary_html, "hint": intraday_hint_value})
+            enqueue(
+                {
+                    "type": "complete",
+                    "html": summary_html,
+                    "hint": intraday_hint_value,
+                    "intraday_last_updated": intraday_last_updated_value,
+                    "intraday_last_updated_label": intraday_last_updated_label,
+                }
+            )
         except IntradayTableNotFound as exc:
             enqueue({"type": "error", "message": f"{exc} Hint: try another date range or enable all tables."})
         except FileNotFoundError as exc:

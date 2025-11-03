@@ -125,6 +125,8 @@
     .summary-placeholder { color: #4b5563; font-size: 0.95rem; }
     .summary-callout { background: #e8f2ff; border: 1px solid #b6d4fe; border-radius: 4px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #0b3d91; font-weight: 600; }
     .summary-callout small { display: block; margin-top: 0.35rem; font-weight: 400; color: #0b3d91; opacity: 0.85; }
+    .intraday-timer { display: block; margin-top: 0.35rem; font-weight: 500; font-size: 0.9rem; color: #0b3d91; }
+    .intraday-timer [data-timer-value] { font-variant-numeric: tabular-nums; font-weight: 700; }
   </style>
 </head>
 <body>
@@ -209,6 +211,16 @@
         {% if intraday_hint %}
           <small>{{ intraday_hint }}</small>
         {% endif %}
+        {% if intraday_last_updated %}
+          <small
+            class="intraday-timer"
+            data-intraday-timer="{{ intraday_last_updated }}"
+            title="Updated {{ intraday_last_updated }}"
+          >
+            Intraday snapshot last updated
+            <span data-timer-value>{{ intraday_last_updated_label or "just now" }}</span>.
+          </small>
+        {% endif %}
       </div>
       {% include "summary_content.html" %}
     {% else %}
@@ -251,6 +263,7 @@
 
       document.addEventListener('DOMContentLoaded', function () {
         attachToggleHandlers(document);
+        initIntradayTimers(document);
       });
 
       var form = document.querySelector('[data-summary-form]');
@@ -394,7 +407,79 @@
         errorContainer.appendChild(errorBlock);
       }
 
-      function createSummaryCallout(hint) {
+      function parseIsoDate(value) {
+        if (value === null || value === undefined) {
+          return null;
+        }
+        var date = new Date(String(value));
+        if (Number.isNaN ? Number.isNaN(date.getTime()) : isNaN(date.getTime())) {
+          return null;
+        }
+        return date;
+      }
+
+      function formatElapsedLabel(date) {
+        var diffMs = Date.now() - date.getTime();
+        if (diffMs < 0) {
+          diffMs = 0;
+        }
+        var totalSeconds = Math.floor(diffMs / 1000);
+        if (totalSeconds < 60) {
+          return totalSeconds + 's ago';
+        }
+        var minutes = Math.floor(totalSeconds / 60);
+        var seconds = totalSeconds % 60;
+        if (minutes < 60) {
+          var paddedSeconds = seconds < 10 ? '0' + seconds : String(seconds);
+          return minutes + 'm ' + paddedSeconds + 's ago';
+        }
+        var hours = Math.floor(minutes / 60);
+        minutes = minutes % 60;
+        if (hours < 24) {
+          var paddedMinutes = minutes < 10 ? '0' + minutes : String(minutes);
+          return hours + 'h ' + paddedMinutes + 'm ago';
+        }
+        var days = Math.floor(hours / 24);
+        hours = hours % 24;
+        return days + 'd ' + hours + 'h ago';
+      }
+
+      function initIntradayTimers(root) {
+        var scope = root || document;
+        scope.querySelectorAll('[data-intraday-timer]').forEach(function (node) {
+          var isoValue = node.getAttribute('data-intraday-timer');
+          if (!isoValue || node.dataset.timerBound === 'true') {
+            return;
+          }
+          var timestamp = parseIsoDate(isoValue);
+          if (!timestamp) {
+            return;
+          }
+          node.dataset.timerBound = 'true';
+          var valueNode = node.querySelector('[data-timer-value]');
+          if (!valueNode) {
+            valueNode = document.createElement('span');
+            valueNode.setAttribute('data-timer-value', '');
+            node.appendChild(valueNode);
+          }
+          node.setAttribute('title', timestamp.toLocaleString());
+          function updateTimer() {
+            if (!document.body.contains(node)) {
+              if (node.dataset.timerInterval) {
+                window.clearInterval(Number(node.dataset.timerInterval));
+                delete node.dataset.timerInterval;
+              }
+              return;
+            }
+            valueNode.textContent = formatElapsedLabel(timestamp);
+          }
+          updateTimer();
+          var intervalId = window.setInterval(updateTimer, 1000);
+          node.dataset.timerInterval = String(intervalId);
+        });
+      }
+
+      function createSummaryCallout(hint, timerIso, timerLabel) {
         var callout = document.createElement('div');
         callout.className = 'summary-callout';
         callout.setAttribute('role', 'status');
@@ -404,18 +489,32 @@
           hintEl.textContent = hint;
           callout.appendChild(hintEl);
         }
+        if (timerIso) {
+          var timerEl = document.createElement('small');
+          timerEl.className = 'intraday-timer';
+          timerEl.setAttribute('data-intraday-timer', timerIso);
+          var labelText = timerLabel || 'just now';
+          timerEl.appendChild(document.createTextNode('Intraday snapshot last updated '));
+          var valueEl = document.createElement('span');
+          valueEl.setAttribute('data-timer-value', '');
+          valueEl.textContent = labelText;
+          timerEl.appendChild(valueEl);
+          timerEl.appendChild(document.createTextNode('.'));
+          callout.appendChild(timerEl);
+        }
         return callout;
       }
 
-      function renderSummary(html, hint) {
+      function renderSummary(html, hint, timerIso, timerLabel) {
         if (typeof html !== 'string') {
           progressPanel.hidden = true;
           return;
         }
         summaryOutput.innerHTML = '';
-        summaryOutput.appendChild(createSummaryCallout(hint));
+        summaryOutput.appendChild(createSummaryCallout(hint, timerIso, timerLabel));
         summaryOutput.insertAdjacentHTML('beforeend', html);
         attachToggleHandlers(summaryOutput);
+        initIntradayTimers(summaryOutput);
         if (typeof summaryOutput.scrollIntoView === 'function') {
           summaryOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
@@ -474,7 +573,12 @@
             } else if (eventData.type === 'complete') {
               completed = true;
               updateProgress(1, 'All set! Your summary is ready.');
-              renderSummary(eventData.html, eventData.hint);
+              renderSummary(
+                eventData.html,
+                eventData.hint,
+                eventData.intraday_last_updated,
+                eventData.intraday_last_updated_label
+              );
             } else if (eventData.type === 'error') {
               errorMessage = eventData.message || 'Summary generation failed.';
             }
