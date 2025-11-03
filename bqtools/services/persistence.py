@@ -18,6 +18,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.engine import Engine
@@ -47,6 +49,12 @@ class Dataset(Base):
     intraday_prefix: Mapped[str | None] = mapped_column(Text, nullable=True)
     credentials_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     default_week_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    intraday_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("FALSE"),
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -80,6 +88,12 @@ class SummaryJob(Base):
     filter_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     options_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    intraday_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("FALSE"),
+    )
 
     dataset: Mapped["Dataset"] = relationship("Dataset", back_populates="summary_jobs")
     exports: Mapped[list["SummaryExport"]] = relationship(
@@ -109,6 +123,12 @@ class SummaryExport(Base):
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     table_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
     reused_cache: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    intraday_fallback: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("FALSE"),
+    )
     csv_row_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     json_row_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     csv_path: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -180,6 +200,7 @@ class PersistenceService:
             self._engine = create_engine(database_url, echo=echo, future=True)
             self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
             Base.metadata.create_all(bind=self._engine)
+            self._ensure_schema_updates(self._engine)
             self._logger.info("Configured PostgreSQL engine and ensured metadata exists.")
         return self._engine
 
@@ -210,6 +231,32 @@ class PersistenceService:
         finally:
             session.close()
             self._logger.debug("Closed session in session_scope.")
+
+    def _ensure_schema_updates(self, engine: Engine) -> None:
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        with engine.begin() as connection:
+            if "datasets" in existing_tables:
+                dataset_columns = {column["name"] for column in inspector.get_columns("datasets")}
+                if "intraday_active" not in dataset_columns:
+                    self._logger.info("Applying schema update: adding datasets.intraday_active column.")
+                    connection.execute(
+                        text("ALTER TABLE datasets ADD COLUMN intraday_active BOOLEAN NOT NULL DEFAULT FALSE")
+                    )
+            if "summary_jobs" in existing_tables:
+                job_columns = {column["name"] for column in inspector.get_columns("summary_jobs")}
+                if "intraday_active" not in job_columns:
+                    self._logger.info("Applying schema update: adding summary_jobs.intraday_active column.")
+                    connection.execute(
+                        text("ALTER TABLE summary_jobs ADD COLUMN intraday_active BOOLEAN NOT NULL DEFAULT FALSE")
+                    )
+            if "summary_exports" in existing_tables:
+                export_columns = {column["name"] for column in inspector.get_columns("summary_exports")}
+                if "intraday_fallback" not in export_columns:
+                    self._logger.info("Applying schema update: adding summary_exports.intraday_fallback column.")
+                    connection.execute(
+                        text("ALTER TABLE summary_exports ADD COLUMN intraday_fallback BOOLEAN NOT NULL DEFAULT FALSE")
+                    )
 
 
 __all__ = [

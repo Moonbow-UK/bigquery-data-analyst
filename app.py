@@ -17,6 +17,7 @@ from threading import Thread
 from typing import Any, Callable
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from google.api_core import exceptions as gcloud_exceptions
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -149,6 +150,16 @@ def _table_kind_from_name(table_name: str) -> str:
     return "unknown"
 
 
+def _is_not_found_error(error: BaseCloudError) -> bool:
+    if isinstance(error, gcloud_exceptions.NotFound):
+        return True
+    code = getattr(error, "code", None)
+    if code in (404, "404"):
+        return True
+    message = getattr(error, "message", "") or str(error)
+    return "not found" in message.lower()
+
+
 def _jsonify(value: Any) -> Any:
     if value is None:
         return None
@@ -261,9 +272,13 @@ def _resolve_exports(
         return exports, "Today", csv_path
     if normalized_key == "yesterday":
         target_date = now - timedelta(days=1)
-        table_name = _table_name_for_range("yesterday", reference_time=target_date)
+        date_str = target_date.strftime("%Y%m%d")
+        table_name = f"events_{date_str}"
         csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
         json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        fallback_table_name = f"{intraday_prefix}{date_str}"
+        fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+        fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
         exports = [
             {
                 "table_name": table_name,
@@ -271,6 +286,10 @@ def _resolve_exports(
                 "csv_path": csv_path,
                 "json_path": json_path,
                 "date": target_date,
+                "fallback_table_name": fallback_table_name,
+                "fallback_full_table_id": f"{project_id}.{dataset_id}.{fallback_table_name}",
+                "fallback_csv_path": fallback_csv_path,
+                "fallback_json_path": fallback_json_path,
             }
         ]
         return exports, "Yesterday", csv_path
@@ -283,6 +302,9 @@ def _resolve_exports(
             table_name = f"events_{date_str}"
             csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
             json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+            fallback_table_name = f"{intraday_prefix}{date_str}"
+            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
             exports.append(
                 {
                     "table_name": table_name,
@@ -290,6 +312,10 @@ def _resolve_exports(
                     "csv_path": csv_path,
                     "json_path": json_path,
                     "date": target_date,
+                    "fallback_table_name": fallback_table_name,
+                    "fallback_full_table_id": f"{project_id}.{dataset_id}.{fallback_table_name}",
+                    "fallback_csv_path": fallback_csv_path,
+                    "fallback_json_path": fallback_json_path,
                 }
             )
         summary_csv = Path(f"{project_id}_{dataset_id}_events_last{days_to_fetch}days.csv")
@@ -308,6 +334,15 @@ def _resolve_exports(
         table_name = f"{intraday_prefix}{date_str}" if is_today else f"events_{date_str}"
         csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
         json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        fallback_table_name: str | None = None
+        fallback_csv_path: Path | None = None
+        fallback_json_path: Path | None = None
+        fallback_full_table_id: str | None = None
+        if not is_today:
+            fallback_table_name = f"{intraday_prefix}{date_str}"
+            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_full_table_id = f"{project_id}.{dataset_id}.{fallback_table_name}"
         exports = [
             {
                 "table_name": table_name,
@@ -315,6 +350,10 @@ def _resolve_exports(
                 "csv_path": csv_path,
                 "json_path": json_path,
                 "date": target_date,
+                "fallback_table_name": fallback_table_name,
+                "fallback_full_table_id": fallback_full_table_id,
+                "fallback_csv_path": fallback_csv_path,
+                "fallback_json_path": fallback_json_path,
             }
         ]
         display_label = target_date.strftime("%B %d, %Y")
@@ -606,28 +645,149 @@ def build_summary_for_range(
         bigquery_service: BigQueryService | None = None
         notes: list[str] = []
         csv_paths_for_summary: list[Path] = []
+        intraday_fallback_detected = False
 
         for export in exports:
-            csv_path = Path(export["csv_path"])
-            json_path = Path(export["json_path"])
-            full_table_id = str(export["full_table_id"])
-            table_name = str(export.get("table_name") or csv_path.stem)
+            primary_table_name = str(export["table_name"])
+            candidates: list[dict[str, object]] = [
+                {
+                    "table_name": primary_table_name,
+                    "full_table_id": str(export["full_table_id"]),
+                    "csv_path": Path(export["csv_path"]),
+                    "json_path": Path(export["json_path"]),
+                }
+            ]
+
+            fallback_table_name = export.get("fallback_table_name")
+            fallback_full_table_id = export.get("fallback_full_table_id")
+            fallback_csv_path = export.get("fallback_csv_path")
+            fallback_json_path = export.get("fallback_json_path")
+            if (
+                fallback_table_name
+                and fallback_full_table_id
+                and fallback_csv_path
+                and fallback_json_path
+            ):
+                fallback_entry = {
+                    "table_name": str(fallback_table_name),
+                    "full_table_id": str(fallback_full_table_id),
+                    "csv_path": Path(fallback_csv_path),
+                    "json_path": Path(fallback_json_path),
+                }
+                candidates.append(fallback_entry)
+
+            selected_candidate = next((c for c in candidates if Path(c["csv_path"]).exists()), None)
+            if selected_candidate is None:
+                selected_candidate = candidates[0]
+
+            table_name = str(selected_candidate["table_name"])
+            full_table_id = str(selected_candidate["full_table_id"])
+            csv_path = Path(selected_candidate["csv_path"])
+            json_path = Path(selected_candidate["json_path"])
             table_kind = _table_kind_from_name(table_name)
-            csv_paths_for_summary.append(csv_path)
+
+            using_fallback = table_name != primary_table_name
+            status_bits: list[str] = []
+
             logger.info(
-                "Preparing export for table %s (kind=%s, needs_csv=%s)",
+                "Preparing export for table %s (kind=%s, needs_csv=%s, fallback=%s)",
                 full_table_id,
                 table_kind,
                 not csv_path.exists(),
+                using_fallback,
             )
 
-            status_bits: list[str] = []
             tracker.update("export", f"Checking local cache for {full_table_id}", 0.1)
 
-            needs_csv = not csv_path.exists()
             csv_rows: int | None = None
             json_rows: int | None = None
-            export_record: SummaryExport | None = None
+
+            if not csv_path.exists():
+                candidate_queue = [selected_candidate] + [
+                    c for c in candidates if c is not selected_candidate
+                ]
+                export_attempted = False
+                for idx, candidate in enumerate(candidate_queue):
+                    candidate_table_name = str(candidate["table_name"])
+                    candidate_full_id = str(candidate["full_table_id"])
+                    candidate_csv_path = Path(candidate["csv_path"])
+                    candidate_json_path = Path(candidate["json_path"])
+                    candidate_kind = _table_kind_from_name(candidate_table_name)
+
+                    if bigquery_service is None:
+                        client = _build_client(
+                            credentials_file=str(form_defaults["credentials_file"]),
+                            scopes=DEFAULT_SCOPES,
+                            project_override=project_override,
+                        )
+                        bigquery_service = BigQueryService(client)
+                        emit("note", "Connected to BigQuery", tracker.current_progress)
+
+                    tracker.update(
+                        "export",
+                        f"Exporting {candidate_full_id} to CSV",
+                        0.3 + idx * 0.05,
+                    )
+                    try:
+                        csv_rows = bigquery_service.export_table_to_csv(
+                            candidate_full_id,
+                            location=location,
+                            output_path=candidate_csv_path,
+                        )
+                        table_name = candidate_table_name
+                        full_table_id = candidate_full_id
+                        csv_path = candidate_csv_path
+                        json_path = candidate_json_path
+                        table_kind = candidate_kind
+                        using_fallback = table_name != primary_table_name
+                        export_attempted = True
+                        break
+                    except BaseCloudError as export_error:
+                        if not _is_not_found_error(export_error) or idx == len(candidate_queue) - 1:
+                            raise
+                        logger.warning(
+                            "Primary table %s not available; trying fallback %s",
+                            candidate_full_id,
+                            candidate_queue[idx + 1]["full_table_id"],
+                        )
+                        continue
+
+                if not export_attempted:
+                    raise RuntimeError("Failed to export any candidate table for summary generation.")
+
+                status_bits.append(f"exported CSV {csv_path.name} ({csv_rows:,} rows)")
+                tracker.update(
+                    "export",
+                    f"Downloaded {csv_rows:,} rows from {full_table_id}",
+                    0.6,
+                )
+            else:
+                status_bits.append(f"reused CSV {csv_path.name}")
+                tracker.update(
+                    "export",
+                    f"Reusing cached CSV for {full_table_id}",
+                    0.4,
+                )
+
+            if not json_path.exists():
+                tracker.update(
+                    "export",
+                    f"Building JSON cache for {full_table_id}",
+                    0.85,
+                )
+                json_rows = _write_json_from_csv(csv_path, json_path)
+                status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
+            else:
+                status_bits.append(f"reused JSON {json_path.name}")
+
+            if using_fallback and export.get("fallback_table_name"):
+                status_bits.append("daily table missing; using intraday snapshot")
+                intraday_fallback_detected = True
+
+            csv_paths_for_summary.append(csv_path)
+
+            note = f"{full_table_id}: {'; '.join(status_bits)}."
+            notes.append(note)
 
             if db_enabled and db_session is not None and job_record is not None:
                 export_record = SummaryExport(
@@ -636,62 +796,44 @@ def build_summary_for_range(
                     full_table_id=full_table_id,
                     target_date=export.get("date").date() if isinstance(export.get("date"), datetime) else None,
                     table_kind=table_kind,
-                    reused_cache=not needs_csv,
+                    reused_cache=csv_rows is None,
+                    csv_row_count=csv_rows,
+                    json_row_count=json_rows,
                     csv_path=str(csv_path),
                     json_path=str(json_path),
                     exported_at=_now_utc(),
+                    notes=note,
+                    intraday_fallback=using_fallback and bool(export.get("fallback_table_name")),
                 )
-                db_session.add(export_record)
-                db_session.commit()
-
-            if needs_csv:
-                tracker.update("export", f"Exporting {full_table_id} to CSV", 0.3)
-                if bigquery_service is None:
-                    client = _build_client(
-                        credentials_file=str(form_defaults["credentials_file"]),
-                        scopes=DEFAULT_SCOPES,
-                        project_override=project_override,
-                    )
-                    bigquery_service = BigQueryService(client)
-                    emit("note", "Connected to BigQuery", tracker.current_progress)
-                csv_rows = bigquery_service.export_table_to_csv(
-                    full_table_id,
-                    location=location,
-                    output_path=csv_path,
-                )
-                status_bits.append(f"exported CSV {csv_path.name} ({csv_rows:,} rows)")
-                tracker.update("export", f"Downloaded {csv_rows:,} rows from {full_table_id}", 0.6)
-            else:
-                status_bits.append(f"reused CSV {csv_path.name}")
-                tracker.update("export", f"Reusing cached CSV for {full_table_id}", 0.4)
-
-            if not json_path.exists():
-                tracker.update("export", f"Building JSON cache for {full_table_id}", 0.85)
-                json_rows = _write_json_from_csv(csv_path, json_path)
-                status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
-            else:
-                status_bits.append(f"reused JSON {json_path.name}")
-
-            note = f"{full_table_id}: {'; '.join(status_bits)}."
-            notes.append(note)
-
-            if db_enabled and export_record is not None and db_session is not None:
-                export_record.reused_cache = not needs_csv
-                export_record.csv_row_count = csv_rows
-                export_record.json_row_count = json_rows
-                export_record.notes = note
-                export_record.exported_at = export_record.exported_at or _now_utc()
                 db_session.add(export_record)
                 db_session.commit()
                 logger.debug(
-                    "Recorded export %s csv_rows=%s json_rows=%s",
+                    "Recorded export %s csv_rows=%s json_rows=%s (intraday=%s)",
                     full_table_id,
                     csv_rows,
                     json_rows,
+                    export_record.intraday_fallback,
                 )
 
             tracker.complete_unit("export", f"Prepared data for {full_table_id}")
             emit("note", note, tracker.current_progress)
+
+        if intraday_fallback_detected:
+            refresh_hint = (
+                "Daily GA4 table not yet published; using intraday snapshot. Run the summary again once the final table is available."
+            )
+            notes.append(refresh_hint)
+            emit("note", refresh_hint, tracker.current_progress)
+
+        if len(csv_paths_for_summary) == 1:
+            actual_csv_path = csv_paths_for_summary[0]
+            if actual_csv_path != summary_csv_path:
+                logger.debug(
+                    "Using intraday CSV %s as summary source (replacing %s).",
+                    actual_csv_path,
+                    summary_csv_path,
+                )
+                summary_csv_path = actual_csv_path
 
         if normalized_range == "last7days":
             tracker.update("combine", "Combining daily exports", 0.3)
@@ -724,6 +866,10 @@ def build_summary_for_range(
         )
 
         if db_enabled and db_session is not None and job_record is not None:
+            job_record.intraday_active = intraday_fallback_detected
+            if dataset_record is not None:
+                dataset_record.intraday_active = intraday_fallback_detected
+                db_session.add(dataset_record)
             ga4_summary = summary.get("ga4_summary") or {}
             total_events_value = ga4_summary.get("total_events")
             if isinstance(total_events_value, (int, float, Decimal)):
@@ -765,6 +911,10 @@ def build_summary_for_range(
             job_record.status = "failed"
             job_record.error_message = str(exc)
             job_record.finished_at = _now_utc()
+            job_record.intraday_active = intraday_fallback_detected
+            if dataset_record is not None:
+                dataset_record.intraday_active = intraday_fallback_detected
+                db_session.add(dataset_record)
             try:
                 db_session.add(job_record)
                 db_session.commit()
