@@ -385,6 +385,7 @@
         progressPanel.hidden = false;
         summaryOutput.classList.add('is-loading');
         updateProgress(0.02, 'Preparing summary request…');
+        updateInlineTimer(null, null);
 
         fetchSummary(payload)
           .catch(function (error) {

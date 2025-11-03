@@ -618,6 +618,8 @@ def build_summary_for_range(
     options: DatasetSummaryOptions,
     progress_callback: Callable[[str, str, float], None] | None = None,
     db_session: Session | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> tuple[dict, str | None]:
     now = _now_utc()
     normalized_range = selected_range.lower()
@@ -757,9 +759,12 @@ def build_summary_for_range(
                 }
                 candidates.append(fallback_entry)
 
-            selected_candidate = next((c for c in candidates if Path(c["csv_path"]).exists()), None)
-            if selected_candidate is None:
+            if force_refresh:
                 selected_candidate = candidates[0]
+            else:
+                selected_candidate = next((c for c in candidates if Path(c["csv_path"]).exists()), None)
+                if selected_candidate is None:
+                    selected_candidate = candidates[0]
 
             table_name = str(selected_candidate["table_name"])
             full_table_id = str(selected_candidate["full_table_id"])
@@ -785,10 +790,15 @@ def build_summary_for_range(
             csv_rows: int | None = None
             json_rows: int | None = None
 
-            if not csv_path.exists():
-                candidate_queue = [selected_candidate] + [
-                    c for c in candidates if c is not selected_candidate
-                ]
+            needs_export = force_refresh or not csv_path.exists()
+
+            if needs_export:
+                if force_refresh:
+                    candidate_queue = candidates
+                else:
+                    candidate_queue = [selected_candidate] + [
+                        c for c in candidates if c is not selected_candidate
+                    ]
                 export_attempted = False
                 for idx, candidate in enumerate(candidate_queue):
                     candidate_table_name = str(candidate["table_name"])
@@ -808,10 +818,20 @@ def build_summary_for_range(
 
                     tracker.update(
                         "export",
-                        f"Exporting {candidate_full_id} to CSV",
+                        (
+                            f"Refreshing {candidate_full_id}"
+                            if force_refresh
+                            else f"Exporting {candidate_full_id} to CSV"
+                        ),
                         0.3 + idx * 0.05,
                     )
                     try:
+                        if force_refresh:
+                            for stale_path in (candidate_csv_path, candidate_json_path):
+                                try:
+                                    stale_path.unlink()
+                                except FileNotFoundError:
+                                    pass
                         csv_rows = bigquery_service.export_table_to_csv(
                             candidate_full_id,
                             location=location,
@@ -838,10 +858,15 @@ def build_summary_for_range(
                 if not export_attempted:
                     raise RuntimeError("Failed to export any candidate table for summary generation.")
 
-                status_bits.append(f"exported CSV {csv_path.name} ({csv_rows:,} rows)")
+                action_label = "refreshed" if force_refresh else "exported"
+                status_bits.append(f"{action_label} CSV {csv_path.name} ({csv_rows:,} rows)")
                 tracker.update(
                     "export",
-                    f"Downloaded {csv_rows:,} rows from {full_table_id}",
+                    (
+                        f"Refreshed {csv_rows:,} rows from {full_table_id}"
+                        if force_refresh
+                        else f"Downloaded {csv_rows:,} rows from {full_table_id}"
+                    ),
                     0.6,
                 )
             else:
@@ -852,14 +877,25 @@ def build_summary_for_range(
                     0.4,
                 )
 
-            if not json_path.exists():
+            json_refresh_needed = force_refresh or not json_path.exists()
+            if json_refresh_needed:
+                if force_refresh and json_path.exists():
+                    try:
+                        json_path.unlink()
+                    except FileNotFoundError:
+                        pass
                 tracker.update(
                     "export",
-                    f"Building JSON cache for {full_table_id}",
+                    (
+                        f"Refreshing JSON cache for {full_table_id}"
+                        if force_refresh
+                        else f"Building JSON cache for {full_table_id}"
+                    ),
                     0.85,
                 )
                 json_rows = _write_json_from_csv(csv_path, json_path)
-                status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
+                json_action = "refreshed" if force_refresh else "generated"
+                status_bits.append(f"{json_action} JSON {json_path.name} ({json_rows:,} rows)")
             else:
                 status_bits.append(f"reused JSON {json_path.name}")
 
@@ -1136,6 +1172,7 @@ def index():
                             form_defaults=form_defaults,
                             options=options,
                             db_session=db_session if _use_database_persistence() else None,
+                            force_refresh=force_refresh,
                         )
                         summary_generated = True
                     if summary_generated:
@@ -1391,6 +1428,7 @@ def progress_summary() -> Response:
                     options=options,
                     progress_callback=progress_cb,
                     db_session=session if _use_database_persistence() else None,
+                    force_refresh=force_refresh,
                 )
                 intraday_hint_value = _intraday_hint(summary)
                 (
