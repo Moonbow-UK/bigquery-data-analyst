@@ -766,6 +766,8 @@ def build_summary_for_range(
             csv_path = Path(selected_candidate["csv_path"])
             json_path = Path(selected_candidate["json_path"])
             table_kind = _table_kind_from_name(table_name)
+            if table_kind == "intraday":
+                intraday_fallback_detected = True
 
             using_fallback = table_name != primary_table_name
             status_bits: list[str] = []

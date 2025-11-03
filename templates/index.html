@@ -125,8 +125,22 @@
     .summary-placeholder { color: #4b5563; font-size: 0.95rem; }
     .summary-callout { background: #e8f2ff; border: 1px solid #b6d4fe; border-radius: 4px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #0b3d91; font-weight: 600; }
     .summary-callout small { display: block; margin-top: 0.35rem; font-weight: 400; color: #0b3d91; opacity: 0.85; }
-    .intraday-timer { display: block; margin-top: 0.35rem; font-weight: 500; font-size: 0.9rem; color: #0b3d91; }
+    .intraday-timer { display: block; font-weight: 500; font-size: 0.9rem; color: #0b3d91; }
     .intraday-timer [data-timer-value] { font-variant-numeric: tabular-nums; font-weight: 700; }
+    .form-field--timer { display: flex; align-items: stretch; }
+    .intraday-timer--inline {
+      background: #fef3c7;
+      border: 1px solid #fcd34d;
+      border-radius: 6px;
+      padding: 0.85rem 0.8rem;
+      color: #92400e;
+      display: grid;
+      gap: 0.3rem;
+      width: 70%;
+      box-shadow: 0 1px 2px rgba(17, 24, 39, 0.08);
+    }
+    .intraday-timer__heading { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #b45309; }
+    .intraday-timer__body { font-size: 1rem; font-weight: 500; color: inherit; }
   </style>
 </head>
 <body>
@@ -171,7 +185,7 @@
           name="force_refresh"
           {% if force_refresh_checked %}checked{% endif %}
         />
-        <label class="checkbox-label" for="force_refresh">Pull fresh data on the next run</label>
+        <label class="checkbox-label" for="force_refresh">Pull fresh data</label>
         <span
           class="info-icon"
           tabindex="0"
@@ -180,6 +194,35 @@
           title="Skip cached summaries and pull fresh data when selected."
         >i</span>
       </div>
+    </div>
+    <div class="form-field form-field--timer">
+      {% if intraday_last_updated %}
+        <div
+          class="intraday-timer intraday-timer--inline"
+          data-intraday-timer-inline
+          data-intraday-timer="{{ intraday_last_updated }}"
+          title="Updated {{ intraday_last_updated }}"
+        >
+          <span class="intraday-timer__heading">Intraday snapshot</span>
+          <span class="intraday-timer__body">
+            Last updated
+            <span data-timer-value>{{ intraday_last_updated_label or "just now" }}</span>
+          </span>
+        </div>
+      {% else %}
+        <div
+          class="intraday-timer intraday-timer--inline"
+          data-intraday-timer-inline
+          hidden
+          aria-hidden="true"
+        >
+          <span class="intraday-timer__heading">Intraday snapshot</span>
+          <span class="intraday-timer__body">
+            Last updated
+            <span data-timer-value>—</span>
+          </span>
+        </div>
+      {% endif %}
     </div>
     <div class="form-actions">
       <span class="form-field__heading">Actions</span>
@@ -448,13 +491,22 @@
         var scope = root || document;
         scope.querySelectorAll('[data-intraday-timer]').forEach(function (node) {
           var isoValue = node.getAttribute('data-intraday-timer');
-          if (!isoValue || node.dataset.timerBound === 'true') {
+          if (!isoValue) {
             return;
           }
           var timestamp = parseIsoDate(isoValue);
           if (!timestamp) {
             return;
           }
+          var isoKey = timestamp.toISOString();
+          if (node.dataset.timerIso === isoKey && node.dataset.timerBound === 'true') {
+            return;
+          }
+          if (node.dataset.timerInterval) {
+            window.clearInterval(Number(node.dataset.timerInterval));
+            delete node.dataset.timerInterval;
+          }
+          node.dataset.timerIso = isoKey;
           node.dataset.timerBound = 'true';
           var valueNode = node.querySelector('[data-timer-value]');
           if (!valueNode) {
@@ -479,6 +531,43 @@
         });
       }
 
+      function updateInlineTimer(timerIso, timerLabel) {
+        var timerEl = document.querySelector('[data-intraday-timer-inline]');
+        if (!timerEl) {
+          return;
+        }
+        var existingInterval = timerEl.dataset.timerInterval;
+        if (existingInterval) {
+          window.clearInterval(Number(existingInterval));
+          delete timerEl.dataset.timerInterval;
+        }
+        timerEl.dataset.timerBound = '';
+        timerEl.dataset.timerIso = '';
+        if (!timerIso) {
+          timerEl.removeAttribute('data-intraday-timer');
+          timerEl.setAttribute('aria-hidden', 'true');
+          timerEl.hidden = true;
+          var placeholder = timerEl.querySelector('[data-timer-value]');
+          if (placeholder) {
+            placeholder.textContent = '—';
+          }
+          timerEl.removeAttribute('title');
+          return;
+        }
+        timerEl.hidden = false;
+        timerEl.removeAttribute('aria-hidden');
+        timerEl.setAttribute('data-intraday-timer', timerIso);
+        timerEl.setAttribute('title', 'Updated ' + timerIso);
+        var valueNode = timerEl.querySelector('[data-timer-value]');
+        if (!valueNode) {
+          valueNode = document.createElement('span');
+          valueNode.setAttribute('data-timer-value', '');
+          timerEl.appendChild(valueNode);
+        }
+        valueNode.textContent = timerLabel || 'just now';
+        initIntradayTimers();
+      }
+
       function createSummaryCallout(hint, timerIso, timerLabel) {
         var callout = document.createElement('div');
         callout.className = 'summary-callout';
@@ -493,6 +582,7 @@
           var timerEl = document.createElement('small');
           timerEl.className = 'intraday-timer';
           timerEl.setAttribute('data-intraday-timer', timerIso);
+          var labelDate = parseIsoDate(timerIso);
           var labelText = timerLabel || 'just now';
           timerEl.appendChild(document.createTextNode('Intraday snapshot last updated '));
           var valueEl = document.createElement('span');
@@ -500,6 +590,9 @@
           valueEl.textContent = labelText;
           timerEl.appendChild(valueEl);
           timerEl.appendChild(document.createTextNode('.'));
+          if (labelDate) {
+            timerEl.setAttribute('title', labelDate.toLocaleString());
+          }
           callout.appendChild(timerEl);
         }
         return callout;
@@ -514,6 +607,7 @@
         summaryOutput.appendChild(createSummaryCallout(hint, timerIso, timerLabel));
         summaryOutput.insertAdjacentHTML('beforeend', html);
         attachToggleHandlers(summaryOutput);
+        updateInlineTimer(timerIso, timerLabel);
         initIntradayTimers(summaryOutput);
         if (typeof summaryOutput.scrollIntoView === 'function') {
           summaryOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
