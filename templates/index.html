@@ -6,13 +6,89 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 2rem; }
     h1 { margin-bottom: 0.5rem; }
-    form { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
-    .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 200px; }
-    .form-field label { font-weight: bold; margin-bottom: 0; }
+    form {
+      margin-bottom: 2rem;
+      padding: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      display: grid;
+      gap: 1rem 1.25rem;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      align-items: start;
+    }
+    .form-field, .form-actions { width: 100%; }
+    .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 220px; }
+    .form-field > label { font-weight: bold; margin-bottom: 0; }
     .form-field small { color: #555; font-size: 0.85rem; }
-    .form-field--checkbox { flex-direction: column; align-items: flex-start; }
-    .form-field--checkbox label { font-weight: 600; display: inline-flex; align-items: center; gap: 0.35rem; }
+    .form-field__heading { font-weight: 700; font-size: 0.95rem; color: #111827; }
+    .form-field--checkbox { flex-direction: column; align-items: flex-start; padding-top: 0.3rem; align-self: start; gap: 0.6rem; }
     .form-field--checkbox input[type="checkbox"] { margin: 0; }
+    .form-actions { display: flex; flex-direction: column; justify-content: flex-start; gap: 0.6rem; min-width: 220px; align-self: start; }
+    .form-actions button { padding: 0.55rem 1.25rem; border-radius: 4px; border: none; background: #1976d2; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.2s ease; }
+    .form-actions button:hover { background: #125aa3; }
+    .form-actions button:disabled { background: #9dbce2; cursor: not-allowed; }
+    .button-row { display: inline-flex; align-items: center; gap: 0.6rem; }
+    .info-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.25rem;
+      height: 1.25rem;
+      border-radius: 50%;
+      border: 1px solid #4b5563;
+      color: #4b5563;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: help;
+      position: relative;
+      background: #fff;
+    }
+    .info-icon::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      bottom: 140%;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1f2937;
+      color: #fff;
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      line-height: 1.2;
+      white-space: normal;
+      min-width: 12rem;
+      max-width: 18rem;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      z-index: 5;
+    }
+    .info-icon::before {
+      content: '';
+      position: absolute;
+      bottom: 115%;
+      left: 50%;
+      transform: translateX(-50%);
+      border-width: 6px;
+      border-style: solid;
+      border-color: #1f2937 transparent transparent transparent;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+      z-index: 5;
+    }
+    .info-icon:hover::after,
+    .info-icon:focus-visible::after,
+    .info-icon:hover::before,
+    .info-icon:focus-visible::before {
+      opacity: 1;
+      transform: translateX(-50%) translateY(-2px);
+    }
+    .info-icon:focus-visible {
+      outline: 2px solid #1976d2;
+      outline-offset: 2px;
+    }
+    .checkbox-row { display: inline-flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; row-gap: 0.4rem; }
+    .checkbox-label { font-weight: 600; display: inline-flex; align-items: center; }
     select, input[type="date"] { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
     th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; vertical-align: top; }
@@ -45,6 +121,9 @@
     .progress-steps li { position: relative; padding-left: 1.2rem; }
     .progress-steps li::before { content: '•'; position: absolute; left: 0; color: #1976d2; }
     .is-loading { opacity: 0.5; transition: opacity 0.2s ease; }
+    .summary-output { border: 1px solid #d0d7de; border-radius: 6px; padding: 1.25rem; background: #fff; min-height: 4rem; transition: opacity 0.2s ease; }
+    .summary-placeholder { color: #4b5563; font-size: 0.95rem; }
+    .summary-callout { background: #e8f2ff; border: 1px solid #b6d4fe; border-radius: 4px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #0b3d91; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -81,18 +160,37 @@
       <small id="custom-date-hint">Leave blank to use the date range above.</small>
     </div>
     <div class="form-field form-field--checkbox">
-      <label for="force_refresh">
+      <span class="form-field__heading">Force refresh</span>
+      <div class="checkbox-row">
         <input
           type="checkbox"
           id="force_refresh"
           name="force_refresh"
           {% if force_refresh_checked %}checked{% endif %}
         />
-        Force refresh
-      </label>
-      <small>Skip cached summaries and pull fresh data when selected.</small>
+        <label class="checkbox-label" for="force_refresh">Pull fresh data on the next run</label>
+        <span
+          class="info-icon"
+          tabindex="0"
+          aria-label="Skip cached summaries and pull fresh data when selected."
+          data-tooltip="Skip cached summaries and pull fresh data when selected."
+          title="Skip cached summaries and pull fresh data when selected."
+        >i</span>
+      </div>
     </div>
-    <button type="submit" name="action" value="generate">Generate summary</button>
+    <div class="form-actions">
+      <span class="form-field__heading">Actions</span>
+      <div class="button-row">
+        <button type="submit" name="action" value="generate">Generate summary</button>
+        <span
+          class="info-icon"
+          tabindex="0"
+          aria-label="We will fetch the latest data and update you on the progress."
+          data-tooltip="We will fetch the latest data and let you know how things are progressing."
+          title="We will fetch the latest data and let you know how things are progressing."
+        >i</span>
+      </div>
+    </div>
   </form>
 
   <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
@@ -103,9 +201,14 @@
     <ul class="progress-steps" id="progress-steps" aria-live="polite" aria-atomic="false"></ul>
   </section>
 
-  <div id="summary-output">
+  <div id="summary-output" class="summary-output">
     {% if summary_generated and summary %}
+      <div class="summary-callout" role="status">Summary ready! Scroll down to explore the highlights below.</div>
       {% include "summary_content.html" %}
+    {% else %}
+      <div class="summary-placeholder">
+        Choose a date range and generate a summary to see the latest insights here.
+      </div>
     {% endif %}
   </div>
 
@@ -287,8 +390,11 @@
 
       function renderSummary(html) {
         if (typeof html === 'string') {
-          summaryOutput.innerHTML = html;
+          summaryOutput.innerHTML = '<div class="summary-callout" role="status">Summary ready! Scroll down to explore the highlights below.</div>' + html;
           attachToggleHandlers(summaryOutput);
+          if (typeof summaryOutput.scrollIntoView === 'function') {
+            summaryOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
         }
         progressPanel.hidden = true;
       }
@@ -344,7 +450,7 @@
               addStep(eventData.message);
             } else if (eventData.type === 'complete') {
               completed = true;
-              updateProgress(1, 'Summary ready.');
+              updateProgress(1, 'All set! Your summary is ready.');
               renderSummary(eventData.html);
             } else if (eventData.type === 'error') {
               errorMessage = eventData.message || 'Summary generation failed.';
