@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
-from logging.handlers import RotatingFileHandler
+from logging.handlers import BaseRotatingHandler
 from pathlib import Path
 from queue import SimpleQueue
 from threading import Thread
@@ -53,14 +53,64 @@ summary_api = create_summary_blueprint(
 )
 app.register_blueprint(summary_api, url_prefix="/api")
 
+class DailyPrefixedFileHandler(BaseRotatingHandler):
+    """Rotate log files daily with filenames like YYYY-MM-DD-app.log."""
+
+    def __init__(
+        self,
+        directory: Path,
+        base_name: str,
+        *,
+        prefix_format: str = "%Y-%m-%d",
+        encoding: str | None = "utf-8",
+        delay: bool = True,
+        utc: bool = False,
+    ) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.base_name = base_name
+        self.prefix_format = prefix_format
+        self.utc = utc
+        self._current_date = None
+        initial_date = self._now().date()
+        initial_path = self._path_for_date(initial_date)
+        super().__init__(str(initial_path), "a", encoding=encoding, delay=delay)
+        self._current_date = initial_date
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc) if self.utc else datetime.now()
+
+    def _path_for_date(self, current_date: date) -> Path:
+        prefix = current_date.strftime(self.prefix_format)
+        return self.directory / f"{prefix}-{self.base_name}"
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        record_dt = datetime.fromtimestamp(
+            record.created,
+            tz=timezone.utc if self.utc else None,
+        )
+        record_date = record_dt.date()
+        if self._current_date != record_date:
+            self._next_date = record_date
+            return True
+        return False
+
+    def doRollover(self) -> None:
+        if getattr(self, "stream", None):
+            self.stream.close()
+            self.stream = None
+        self._current_date = getattr(self, "_next_date", self._now().date())
+        new_path = self._path_for_date(self._current_date)
+        self.baseFilename = str(new_path)
+        self.stream = self._open()
+
+
 LOG_DIR = Path("var/logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "app.log"
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5)
+    file_handler = DailyPrefixedFileHandler(LOG_DIR, "app.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
     )
@@ -1569,4 +1619,4 @@ def progress_summary() -> Response:
 
 if __name__ == "__main__":
     # Bind to all interfaces so the app works in container/remote dev setups.
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5500)
