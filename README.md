@@ -178,6 +178,8 @@ Open [http://127.0.0.1:5000/](http://127.0.0.1:5000/) and enter:
 
 The page displays dataset metadata, a table overview, and per-table drill-down sections rendered as HTML tables for easy sharing with non-technical stakeholders.
 
+Daily run logs land under `var/logs/` with filenames prefixed by the UTC date (for example `2025-11-04-app.log`). Cached summary reuse and BigQuery refreshes are annotated there, making it easy to confirm when the app serves previously generated reports.
+
 ### HTTP API
 
 The Flask app also exposes a JSON API under `/api/summary`, powered by the same service layer. POST a payload to retrieve structured data (and optional pre-rendered text) suitable for chat/LLM integrations or dashboards:

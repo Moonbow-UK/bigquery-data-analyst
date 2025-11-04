@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import logging
 import os
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
-from logging.handlers import RotatingFileHandler
+from decimal import Decimal, DecimalException
+from logging.handlers import BaseRotatingHandler
 from pathlib import Path
 from queue import SimpleQueue
 from threading import Thread
 from typing import Any, Callable
 
-from flask import Flask, Response, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from google.api_core import exceptions as gcloud_exceptions
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from bqtools import (
     DEFAULT_SCOPES,
@@ -31,13 +33,12 @@ from bqtools import (
 from bqtools.api import SummaryAPIConfig, create_summary_blueprint
 from bqtools.config import default_credentials_file, load_environment
 from bqtools.services.dataset_summary import BaseCloudError
-from db import (
+from bqtools.services.persistence import (
     Dataset,
+    PersistenceService,
     SummaryExport,
     SummaryJob,
     SummaryReport,
-    get_session,
-    is_configured,
 )
 
 load_environment()
@@ -52,14 +53,64 @@ summary_api = create_summary_blueprint(
 )
 app.register_blueprint(summary_api, url_prefix="/api")
 
+class DailyPrefixedFileHandler(BaseRotatingHandler):
+    """Rotate log files daily with filenames like YYYY-MM-DD-app.log."""
+
+    def __init__(
+        self,
+        directory: Path,
+        base_name: str,
+        *,
+        prefix_format: str = "%Y-%m-%d",
+        encoding: str | None = "utf-8",
+        delay: bool = True,
+        utc: bool = False,
+    ) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.base_name = base_name
+        self.prefix_format = prefix_format
+        self.utc = utc
+        self._current_date = None
+        initial_date = self._now().date()
+        initial_path = self._path_for_date(initial_date)
+        super().__init__(str(initial_path), "a", encoding=encoding, delay=delay)
+        self._current_date = initial_date
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc) if self.utc else datetime.now()
+
+    def _path_for_date(self, current_date: date) -> Path:
+        prefix = current_date.strftime(self.prefix_format)
+        return self.directory / f"{prefix}-{self.base_name}"
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        record_dt = datetime.fromtimestamp(
+            record.created,
+            tz=timezone.utc if self.utc else None,
+        )
+        record_date = record_dt.date()
+        if self._current_date != record_date:
+            self._next_date = record_date
+            return True
+        return False
+
+    def doRollover(self) -> None:
+        if getattr(self, "stream", None):
+            self.stream.close()
+            self.stream = None
+        self._current_date = getattr(self, "_next_date", self._now().date())
+        new_path = self._path_for_date(self._current_date)
+        self.baseFilename = str(new_path)
+        self.stream = self._open()
+
+
 LOG_DIR = Path("var/logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "app.log"
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5)
+    file_handler = DailyPrefixedFileHandler(LOG_DIR, "app.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
     )
@@ -68,8 +119,86 @@ if not logger.handlers:
     stream_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
     )
-    logger.addHandler(stream_handler)
+logger.addHandler(stream_handler)
 logger.propagate = False
+
+persistence_service = PersistenceService(logger=logger.getChild("persistence"))
+
+
+def _coerce_positive_int(value: Any, default: int = 1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            coerced = int(value)
+        except (OverflowError, ValueError):
+            return default
+        return coerced if coerced > 0 else default
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            coerced = int(Decimal(text))
+        except (ValueError, ArithmeticError, DecimalException):
+            return default
+        return coerced if coerced > 0 else default
+    return default
+
+
+def _compute_product_purchase_stats(csv_paths: list[Path], top_n: int = 10) -> dict[str, list[dict[str, object]]]:
+    counts: Counter[str] = Counter()
+    for csv_path in csv_paths:
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                reader = csv.DictReader(csv_file)
+                if not reader.fieldnames:
+                    continue
+                for row in reader:
+                    event_name = (row.get("event_name") or "").strip().lower()
+                    if event_name != "purchase":
+                        continue
+                    items_payload = row.get("items")
+                    if not items_payload:
+                        continue
+                    try:
+                        parsed_items = json.loads(items_payload)
+                    except json.JSONDecodeError:
+                        logger.debug("Failed to parse items payload for %s", csv_path)
+                        continue
+                    if not isinstance(parsed_items, list):
+                        continue
+                    for item in parsed_items:
+                        if not isinstance(item, dict):
+                            continue
+                        name = (
+                            item.get("item_name")
+                            or item.get("item_id")
+                            or item.get("item_brand")
+                            or "Unknown product"
+                        )
+                        name_str = str(name).strip() or "Unknown product"
+                        quantity = _coerce_positive_int(item.get("quantity"), default=1)
+                        counts[name_str] += quantity
+        except FileNotFoundError:
+            logger.debug("CSV path missing during product stats computation: %s", csv_path)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to compute product stats from %s: %s", csv_path, exc)
+
+    if not counts:
+        return {"most_purchased": [], "least_purchased": []}
+
+    most = [
+        {"name": name, "count": count}
+        for name, count in counts.most_common(top_n)
+    ]
+
+    least_sorted = sorted(counts.items(), key=lambda item: (item[1], item[0]))
+    least = [{"name": name, "count": count} for name, count in least_sorted[:top_n]]
+    return {"most_purchased": most, "least_purchased": least}
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -138,6 +267,48 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _format_elapsed_label(timestamp: datetime, *, reference: datetime | None = None) -> str:
+    base = reference or _now_utc()
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    else:
+        base = base.astimezone(timezone.utc)
+
+    seconds_total = int((base - timestamp).total_seconds())
+    if seconds_total < 0:
+        seconds_total = 0
+    if seconds_total < 60:
+        return f"{seconds_total}s ago"
+    minutes, seconds = divmod(seconds_total, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes:02d}m ago"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h ago"
+
+
 def _table_kind_from_name(table_name: str) -> str:
     lowered = table_name.lower()
     if "intraday" in lowered:
@@ -145,6 +316,30 @@ def _table_kind_from_name(table_name: str) -> str:
     if "events" in lowered:
         return "daily"
     return "unknown"
+
+
+_INTRADAY_HINT_MESSAGE = (
+    "Daily GA4 table not yet published; using intraday snapshot. Run the summary again once the final table is available."
+)
+
+
+def _is_not_found_error(error: BaseCloudError) -> bool:
+    if isinstance(error, gcloud_exceptions.NotFound):
+        return True
+    code = getattr(error, "code", None)
+    if code in (404, "404"):
+        return True
+    message = getattr(error, "message", "") or str(error)
+    return "not found" in message.lower()
+
+
+def _intraday_hint(summary: dict | None, fallback_flag: bool | None = None) -> str:
+    is_intraday = False
+    if summary and isinstance(summary, dict):
+        is_intraday = bool(summary.get("intraday_active"))
+    if fallback_flag is not None:
+        is_intraday = is_intraday or bool(fallback_flag)
+    return _INTRADAY_HINT_MESSAGE if is_intraday else ""
 
 
 def _jsonify(value: Any) -> Any:
@@ -167,6 +362,20 @@ def _jsonify(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonify(item) for item in value]
     return str(value)
+
+
+def _use_database_persistence() -> bool:
+    return persistence_service.is_database_mode()
+
+
+def _enter_csv_mode(summary_csv_path: Path) -> None:
+    os.environ["BIGQUERY_USE_CSV"] = "true"
+    os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
+
+
+def _exit_csv_mode() -> None:
+    os.environ.pop("BIGQUERY_USE_CSV", None)
+    os.environ.pop("BIGQUERY_USE_CSV_FILE", None)
 
 
 def _write_json_from_csv(csv_path: Path, json_path: Path) -> int:
@@ -224,11 +433,13 @@ def _resolve_exports(
     project_id: str,
     dataset_id: str,
     week_days: int,
+    intraday_prefix: str,
 ) -> tuple[list[dict[str, Path | str | datetime]], str, Path]:
     normalized_key = range_key.lower()
     if normalized_key == "today":
         target_date = now
-        table_name = _table_name_for_range("today", reference_time=target_date)
+        date_str = target_date.strftime("%Y%m%d")
+        table_name = f"{intraday_prefix}{date_str}"
         csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
         json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
         exports = [
@@ -243,9 +454,13 @@ def _resolve_exports(
         return exports, "Today", csv_path
     if normalized_key == "yesterday":
         target_date = now - timedelta(days=1)
-        table_name = _table_name_for_range("yesterday", reference_time=target_date)
+        date_str = target_date.strftime("%Y%m%d")
+        table_name = f"events_{date_str}"
         csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
         json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        fallback_table_name = f"{intraday_prefix}{date_str}"
+        fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+        fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
         exports = [
             {
                 "table_name": table_name,
@@ -253,6 +468,10 @@ def _resolve_exports(
                 "csv_path": csv_path,
                 "json_path": json_path,
                 "date": target_date,
+                "fallback_table_name": fallback_table_name,
+                "fallback_full_table_id": f"{project_id}.{dataset_id}.{fallback_table_name}",
+                "fallback_csv_path": fallback_csv_path,
+                "fallback_json_path": fallback_json_path,
             }
         ]
         return exports, "Yesterday", csv_path
@@ -265,6 +484,9 @@ def _resolve_exports(
             table_name = f"events_{date_str}"
             csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
             json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+            fallback_table_name = f"{intraday_prefix}{date_str}"
+            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
             exports.append(
                 {
                     "table_name": table_name,
@@ -272,12 +494,195 @@ def _resolve_exports(
                     "csv_path": csv_path,
                     "json_path": json_path,
                     "date": target_date,
+                    "fallback_table_name": fallback_table_name,
+                    "fallback_full_table_id": f"{project_id}.{dataset_id}.{fallback_table_name}",
+                    "fallback_csv_path": fallback_csv_path,
+                    "fallback_json_path": fallback_json_path,
                 }
             )
         summary_csv = Path(f"{project_id}_{dataset_id}_events_last{days_to_fetch}days.csv")
         day_label = "day" if days_to_fetch == 1 else "days"
         return exports, f"Last {days_to_fetch} {day_label}", summary_csv
+    if normalized_key.startswith("date:"):
+        _, _, date_part = normalized_key.partition(":")
+        try:
+            target_date = datetime.strptime(date_part, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD.") from exc
+        if target_date.date() > now.date():
+            raise ValueError("Selected date cannot be in the future.")
+        date_str = target_date.strftime("%Y%m%d")
+        is_today = target_date.date() == now.date()
+        table_name = f"{intraday_prefix}{date_str}" if is_today else f"events_{date_str}"
+        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
+        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        fallback_table_name: str | None = None
+        fallback_csv_path: Path | None = None
+        fallback_json_path: Path | None = None
+        fallback_full_table_id: str | None = None
+        if not is_today:
+            fallback_table_name = f"{intraday_prefix}{date_str}"
+            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
+            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_full_table_id = f"{project_id}.{dataset_id}.{fallback_table_name}"
+        exports = [
+            {
+                "table_name": table_name,
+                "full_table_id": f"{project_id}.{dataset_id}.{table_name}",
+                "csv_path": csv_path,
+                "json_path": json_path,
+                "date": target_date,
+                "fallback_table_name": fallback_table_name,
+                "fallback_full_table_id": fallback_full_table_id,
+                "fallback_csv_path": fallback_csv_path,
+                "fallback_json_path": fallback_json_path,
+            }
+        ]
+        display_label = target_date.strftime("%B %d, %Y")
+        return exports, display_label, csv_path
     raise ValueError("Selected date range is not supported yet.")
+
+
+@dataclass
+class CachedSummaryArtifacts:
+    dataset: Dataset
+    job: SummaryJob
+    report: SummaryReport
+
+
+@dataclass
+class CachedSummaryResult:
+    summary: dict[str, Any]
+    filter_note: str
+    job: SummaryJob
+    report: SummaryReport
+
+
+def _resolve_intraday_timestamp_payload(
+    summary: dict[str, Any] | None,
+    *,
+    job: SummaryJob | None = None,
+) -> tuple[str | None, str | None]:
+    if not summary or not summary.get("intraday_active"):
+        return None, None
+    timestamp = _parse_timestamp(summary.get("intraday_last_updated_at"))
+    if timestamp is None and job is not None:
+        timestamp = _parse_timestamp(getattr(job, "finished_at", None))
+    if timestamp is None:
+        timestamp = _now_utc()
+    return timestamp.isoformat(timespec="seconds"), _format_elapsed_label(timestamp)
+
+
+def _coerce_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _append_cached_suffix(note: str | None, job: SummaryJob) -> str:
+    timestamp = job.finished_at
+    if timestamp is not None:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        suffix = f"Cached summary generated on {timestamp.strftime('%Y-%m-%d %H:%M:%S %Z')}."
+    else:
+        suffix = "Cached summary reused."
+    if not note:
+        return suffix
+    trimmed = note.rstrip()
+    if trimmed.endswith((".", "!", "?")):
+        return f"{trimmed} {suffix}"
+    return f"{trimmed}. {suffix}"
+
+
+def _assemble_summary_from_report(artifacts: CachedSummaryArtifacts) -> CachedSummaryResult | None:
+    report = artifacts.report
+    summary_payload = report.raw_summary_json
+    if isinstance(summary_payload, str):
+        try:
+            summary_payload = json.loads(summary_payload)
+        except json.JSONDecodeError:
+            summary_payload = None
+    if isinstance(summary_payload, dict):
+        summary_data: dict[str, Any] = copy.deepcopy(summary_payload)
+    else:
+        summary_data = {}
+
+    if report.summary_mode == "csv":
+        summary_data.setdefault("mode", "csv")
+        if report.sections_json and "csv_sections" not in summary_data:
+            summary_data["csv_sections"] = report.sections_json
+        narrative_payload = report.narrative_json or {}
+        if "csv_report_text" not in summary_data and isinstance(narrative_payload, dict):
+            text_value = narrative_payload.get("text")
+            if text_value:
+                summary_data["csv_report_text"] = text_value
+        if "ga4_summary" not in summary_data and report.total_events is not None:
+            summary_data["ga4_summary"] = {"total_events": report.total_events}
+    if report.dataset_snapshot and "dataset" not in summary_data:
+        summary_data["dataset"] = report.dataset_snapshot
+    if "csv_sections" not in summary_data:
+        summary_data["csv_sections"] = []
+
+    intraday_flag = bool(summary_data.get("intraday_active"))
+    if not intraday_flag:
+        intraday_flag = bool(getattr(artifacts.job, "intraday_active", False))
+    summary_data["intraday_active"] = intraday_flag
+    if intraday_flag and "intraday_last_updated_at" not in summary_data:
+        finished_at = _parse_timestamp(getattr(artifacts.job, "finished_at", None))
+        if finished_at is not None:
+            summary_data["intraday_last_updated_at"] = finished_at.isoformat(timespec="seconds")
+
+    if not summary_data:
+        return None
+
+    filter_note = _append_cached_suffix(artifacts.job.filter_note, artifacts.job)
+
+    return CachedSummaryResult(
+        summary=summary_data,
+        filter_note=filter_note,
+        job=artifacts.job,
+        report=report,
+    )
+
+
+def _find_cached_summary_artifacts(
+    range_key: str,
+    *,
+    project_id: str,
+    dataset_id: str,
+    session: Session,
+) -> CachedSummaryArtifacts | None:
+    dataset_stmt = select(Dataset).where(
+        Dataset.project_id == project_id,
+        Dataset.dataset_id == dataset_id,
+    )
+    dataset_record = session.execute(dataset_stmt).scalar_one_or_none()
+    if dataset_record is None:
+        return None
+
+    job_stmt = (
+        select(SummaryJob)
+        .where(
+            SummaryJob.dataset_id == dataset_record.id,
+            SummaryJob.range_key == range_key,
+            SummaryJob.status == "completed",
+        )
+        .order_by(SummaryJob.finished_at.desc().nullslast(), SummaryJob.started_at.desc().nullslast())
+        .options(joinedload(SummaryJob.report))
+    )
+    job_record = session.execute(job_stmt).scalars().first()
+    if job_record is None or job_record.report is None:
+        return None
+    return CachedSummaryArtifacts(dataset=dataset_record, job=job_record, report=job_record.report)
 
 
 def _load_form_defaults() -> dict[str, object]:
@@ -339,29 +744,35 @@ def build_summary_for_range(
     options: DatasetSummaryOptions,
     progress_callback: Callable[[str, str, float], None] | None = None,
     db_session: Session | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> tuple[dict, str | None]:
     now = _now_utc()
     normalized_range = selected_range.lower()
     project_id, dataset_id = _split_dataset(str(form_defaults["dataset"]))
+    intraday_prefix = str(form_defaults["intraday_prefix"])
     exports, range_label, summary_csv_path = _resolve_exports(
         normalized_range,
         now=now,
         project_id=project_id,
         dataset_id=dataset_id,
         week_days=int(form_defaults["week_days"]),
+        intraday_prefix=intraday_prefix,
     )
+    persistence_mode = persistence_service.mode
+    db_enabled = db_session is not None and persistence_mode == "DB"
     logger.info(
-        "Summary run started for %s.%s range=%s exports=%d",
+        "Summary run started for %s.%s range=%s exports=%d mode=%s",
         project_id,
         dataset_id,
         normalized_range,
         len(exports),
+        persistence_mode,
     )
 
     location = str(form_defaults["location"]).strip() or None
     project_override = str(form_defaults["project"]) if form_defaults["project"] else None
     credentials_path = str(form_defaults["credentials_file"]) if form_defaults["credentials_file"] else None
-    intraday_prefix = str(form_defaults["intraday_prefix"])
     week_days = int(form_defaults["week_days"])
 
     external_progress_callback = progress_callback
@@ -369,21 +780,21 @@ def build_summary_for_range(
     dataset_record: Dataset | None = None
 
     def emit(stage: str, message: str, progress_value: float) -> None:
-        if job_record and isinstance(job_record, SummaryJob) and db_session is not None and stage != "complete":
+        if db_enabled and job_record and stage != "complete":
             try:
                 job_record.progress = float(progress_value)
-                if job_record.status != "running":
+                if job_record.status not in {"running", "completed", "failed"}:
                     job_record.status = "running"
-                db_session.add(job_record)
-                db_session.commit()
+                db_session.add(job_record)  # type: ignore[union-attr]
+                db_session.commit()  # type: ignore[union-attr]
             except SQLAlchemyError:
-                db_session.rollback()
+                db_session.rollback()  # type: ignore[union-attr]
                 raise
         if external_progress_callback:
             external_progress_callback(stage, message, progress_value)
 
     try:
-        if db_session is not None:
+        if db_enabled and db_session is not None:
             dataset_stmt = select(Dataset).where(
                 Dataset.project_id == project_id,
                 Dataset.dataset_id == dataset_id,
@@ -442,92 +853,239 @@ def build_summary_for_range(
         bigquery_service: BigQueryService | None = None
         notes: list[str] = []
         csv_paths_for_summary: list[Path] = []
+        latest_export_timestamp: datetime | None = None
+        intraday_fallback_detected = False
 
         for export in exports:
-            csv_path = Path(export["csv_path"])
-            json_path = Path(export["json_path"])
-            full_table_id = str(export["full_table_id"])
-            table_name = str(export.get("table_name") or csv_path.stem)
+            primary_table_name = str(export["table_name"])
+            candidates: list[dict[str, object]] = [
+                {
+                    "table_name": primary_table_name,
+                    "full_table_id": str(export["full_table_id"]),
+                    "csv_path": Path(export["csv_path"]),
+                    "json_path": Path(export["json_path"]),
+                }
+            ]
+
+            fallback_table_name = export.get("fallback_table_name")
+            fallback_full_table_id = export.get("fallback_full_table_id")
+            fallback_csv_path = export.get("fallback_csv_path")
+            fallback_json_path = export.get("fallback_json_path")
+            if (
+                fallback_table_name
+                and fallback_full_table_id
+                and fallback_csv_path
+                and fallback_json_path
+            ):
+                fallback_entry = {
+                    "table_name": str(fallback_table_name),
+                    "full_table_id": str(fallback_full_table_id),
+                    "csv_path": Path(fallback_csv_path),
+                    "json_path": Path(fallback_json_path),
+                }
+                candidates.append(fallback_entry)
+
+            if force_refresh:
+                selected_candidate = candidates[0]
+            else:
+                selected_candidate = next((c for c in candidates if Path(c["csv_path"]).exists()), None)
+                if selected_candidate is None:
+                    selected_candidate = candidates[0]
+
+            table_name = str(selected_candidate["table_name"])
+            full_table_id = str(selected_candidate["full_table_id"])
+            csv_path = Path(selected_candidate["csv_path"])
+            json_path = Path(selected_candidate["json_path"])
             table_kind = _table_kind_from_name(table_name)
-            csv_paths_for_summary.append(csv_path)
+            if table_kind == "intraday":
+                intraday_fallback_detected = True
+
+            using_fallback = table_name != primary_table_name
+            status_bits: list[str] = []
+
             logger.info(
-                "Preparing export for table %s (kind=%s, needs_csv=%s)",
+                "Preparing export for table %s (kind=%s, needs_csv=%s, fallback=%s)",
                 full_table_id,
                 table_kind,
                 not csv_path.exists(),
+                using_fallback,
             )
 
-            status_bits: list[str] = []
             tracker.update("export", f"Checking local cache for {full_table_id}", 0.1)
 
-            needs_csv = not csv_path.exists()
             csv_rows: int | None = None
             json_rows: int | None = None
-            export_record: SummaryExport | None = None
 
-            if db_session is not None and job_record is not None:
+            needs_export = force_refresh or not csv_path.exists()
+
+            if needs_export:
+                if force_refresh:
+                    candidate_queue = candidates
+                else:
+                    candidate_queue = [selected_candidate] + [
+                        c for c in candidates if c is not selected_candidate
+                    ]
+                export_attempted = False
+                for idx, candidate in enumerate(candidate_queue):
+                    candidate_table_name = str(candidate["table_name"])
+                    candidate_full_id = str(candidate["full_table_id"])
+                    candidate_csv_path = Path(candidate["csv_path"])
+                    candidate_json_path = Path(candidate["json_path"])
+                    candidate_kind = _table_kind_from_name(candidate_table_name)
+
+                    if bigquery_service is None:
+                        client = _build_client(
+                            credentials_file=str(form_defaults["credentials_file"]),
+                            scopes=DEFAULT_SCOPES,
+                            project_override=project_override,
+                        )
+                        bigquery_service = BigQueryService(client)
+                        emit("note", "Connected to BigQuery", tracker.current_progress)
+
+                    tracker.update(
+                        "export",
+                        (
+                            f"Refreshing {candidate_full_id}"
+                            if force_refresh
+                            else f"Exporting {candidate_full_id} to CSV"
+                        ),
+                        0.3 + idx * 0.05,
+                    )
+                    try:
+                        if force_refresh:
+                            for stale_path in (candidate_csv_path, candidate_json_path):
+                                try:
+                                    stale_path.unlink()
+                                except FileNotFoundError:
+                                    pass
+                        csv_rows = bigquery_service.export_table_to_csv(
+                            candidate_full_id,
+                            location=location,
+                            output_path=candidate_csv_path,
+                        )
+                        table_name = candidate_table_name
+                        full_table_id = candidate_full_id
+                        csv_path = candidate_csv_path
+                        json_path = candidate_json_path
+                        table_kind = candidate_kind
+                        using_fallback = table_name != primary_table_name
+                        export_attempted = True
+                        break
+                    except BaseCloudError as export_error:
+                        if not _is_not_found_error(export_error) or idx == len(candidate_queue) - 1:
+                            raise
+                        logger.warning(
+                            "Primary table %s not available; trying fallback %s",
+                            candidate_full_id,
+                            candidate_queue[idx + 1]["full_table_id"],
+                        )
+                        continue
+
+                if not export_attempted:
+                    raise RuntimeError("Failed to export any candidate table for summary generation.")
+
+                action_label = "refreshed" if force_refresh else "exported"
+                status_bits.append(f"{action_label} CSV {csv_path.name} ({csv_rows:,} rows)")
+                tracker.update(
+                    "export",
+                    (
+                        f"Refreshed {csv_rows:,} rows from {full_table_id}"
+                        if force_refresh
+                        else f"Downloaded {csv_rows:,} rows from {full_table_id}"
+                    ),
+                    0.6,
+                )
+            else:
+                status_bits.append(f"reused CSV {csv_path.name}")
+                tracker.update(
+                    "export",
+                    f"Reusing cached CSV for {full_table_id}",
+                    0.4,
+                )
+
+            json_refresh_needed = force_refresh or not json_path.exists()
+            if json_refresh_needed:
+                if force_refresh and json_path.exists():
+                    try:
+                        json_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                tracker.update(
+                    "export",
+                    (
+                        f"Refreshing JSON cache for {full_table_id}"
+                        if force_refresh
+                        else f"Building JSON cache for {full_table_id}"
+                    ),
+                    0.85,
+                )
+                json_rows = _write_json_from_csv(csv_path, json_path)
+                json_action = "refreshed" if force_refresh else "generated"
+                status_bits.append(f"{json_action} JSON {json_path.name} ({json_rows:,} rows)")
+            else:
+                status_bits.append(f"reused JSON {json_path.name}")
+
+            try:
+                candidate_timestamp = datetime.fromtimestamp(csv_path.stat().st_mtime, tz=timezone.utc)
+                if latest_export_timestamp is None or candidate_timestamp > latest_export_timestamp:
+                    latest_export_timestamp = candidate_timestamp
+            except FileNotFoundError:
+                pass
+
+            if using_fallback and export.get("fallback_table_name"):
+                status_bits.append("daily table missing; using intraday snapshot")
+                intraday_fallback_detected = True
+
+            csv_paths_for_summary.append(csv_path)
+
+            note = f"{full_table_id}: {'; '.join(status_bits)}."
+            notes.append(note)
+
+            if db_enabled and db_session is not None and job_record is not None:
                 export_record = SummaryExport(
                     job_id=job_record.id,
                     table_name=table_name,
                     full_table_id=full_table_id,
                     target_date=export.get("date").date() if isinstance(export.get("date"), datetime) else None,
                     table_kind=table_kind,
-                    reused_cache=not needs_csv,
+                    reused_cache=csv_rows is None,
+                    csv_row_count=csv_rows,
+                    json_row_count=json_rows,
                     csv_path=str(csv_path),
                     json_path=str(json_path),
                     exported_at=_now_utc(),
+                    notes=note,
+                    intraday_fallback=using_fallback and bool(export.get("fallback_table_name")),
                 )
-                db_session.add(export_record)
-                db_session.commit()
-
-            if needs_csv:
-                tracker.update("export", f"Exporting {full_table_id} to CSV", 0.3)
-                if bigquery_service is None:
-                    client = _build_client(
-                        credentials_file=str(form_defaults["credentials_file"]),
-                        scopes=DEFAULT_SCOPES,
-                        project_override=project_override,
-                    )
-                    bigquery_service = BigQueryService(client)
-                    emit("note", "Connected to BigQuery", tracker.current_progress)
-                csv_rows = bigquery_service.export_table_to_csv(
-                    full_table_id,
-                    location=location,
-                    output_path=csv_path,
-                )
-                status_bits.append(f"exported CSV {csv_path.name} ({csv_rows:,} rows)")
-                tracker.update("export", f"Downloaded {csv_rows:,} rows from {full_table_id}", 0.6)
-            else:
-                status_bits.append(f"reused CSV {csv_path.name}")
-                tracker.update("export", f"Reusing cached CSV for {full_table_id}", 0.4)
-
-            if not json_path.exists():
-                tracker.update("export", f"Building JSON cache for {full_table_id}", 0.85)
-                json_rows = _write_json_from_csv(csv_path, json_path)
-                status_bits.append(f"generated JSON {json_path.name} ({json_rows:,} rows)")
-            else:
-                status_bits.append(f"reused JSON {json_path.name}")
-
-            note = f"{full_table_id}: {'; '.join(status_bits)}."
-            notes.append(note)
-
-            if export_record is not None and db_session is not None:
-                export_record.reused_cache = not needs_csv
-                export_record.csv_row_count = csv_rows
-                export_record.json_row_count = json_rows
-                export_record.notes = note
-                export_record.exported_at = export_record.exported_at or _now_utc()
                 db_session.add(export_record)
                 db_session.commit()
                 logger.debug(
-                    "Recorded export %s csv_rows=%s json_rows=%s",
+                    "Recorded export %s csv_rows=%s json_rows=%s (intraday=%s)",
                     full_table_id,
                     csv_rows,
                     json_rows,
+                    export_record.intraday_fallback,
                 )
 
             tracker.complete_unit("export", f"Prepared data for {full_table_id}")
             emit("note", note, tracker.current_progress)
+
+        if intraday_fallback_detected:
+            refresh_hint = (
+                "Daily GA4 table not yet published; using intraday snapshot. Run the summary again once the final table is available."
+            )
+            notes.append(refresh_hint)
+            emit("note", refresh_hint, tracker.current_progress)
+
+        if len(csv_paths_for_summary) == 1:
+            actual_csv_path = csv_paths_for_summary[0]
+            if actual_csv_path != summary_csv_path:
+                logger.debug(
+                    "Using intraday CSV %s as summary source (replacing %s).",
+                    actual_csv_path,
+                    summary_csv_path,
+                )
+                summary_csv_path = actual_csv_path
 
         if normalized_range == "last7days":
             tracker.update("combine", "Combining daily exports", 0.3)
@@ -545,12 +1103,14 @@ def build_summary_for_range(
                 combined_rows,
             )
 
-        os.environ["BIGQUERY_USE_CSV"] = "true"
-        os.environ["BIGQUERY_USE_CSV_FILE"] = str(summary_csv_path)
-
+        if persistence_mode == "DB":
+            _exit_csv_mode()
+        _enter_csv_mode(summary_csv_path)
         tracker.update("summary", "Generating dataset summary", 0.3)
         service = DatasetSummaryService(None)
         summary = service.build_summary(dataset=None, tables=[], options=options)
+        if isinstance(summary, dict):
+            summary["intraday_active"] = intraday_fallback_detected
         tracker.complete_unit("summary", f"Summary ready for {service.csv_path.name}")
 
         summary_note = f"CSV mode active: summarising {service.csv_path.name}."
@@ -559,7 +1119,26 @@ def build_summary_for_range(
             f"{range_label}: {details} {summary_note}" if details else f"{range_label}: {summary_note}"
         )
 
-        if db_session is not None and job_record is not None:
+        product_purchase_stats = _compute_product_purchase_stats(csv_paths_for_summary)
+        summary["product_purchase_stats"] = product_purchase_stats
+
+        if summary.get("intraday_active"):
+            if latest_export_timestamp is None:
+                for candidate_path in csv_paths_for_summary:
+                    try:
+                        candidate_ts = datetime.fromtimestamp(candidate_path.stat().st_mtime, tz=timezone.utc)
+                    except FileNotFoundError:
+                        continue
+                    if latest_export_timestamp is None or candidate_ts > latest_export_timestamp:
+                        latest_export_timestamp = candidate_ts
+            timestamp_value = latest_export_timestamp or _now_utc()
+            summary.setdefault("intraday_last_updated_at", timestamp_value.isoformat(timespec="seconds"))
+
+        if db_enabled and db_session is not None and job_record is not None:
+            job_record.intraday_active = intraday_fallback_detected
+            if dataset_record is not None:
+                dataset_record.intraday_active = intraday_fallback_detected
+                db_session.add(dataset_record)
             ga4_summary = summary.get("ga4_summary") or {}
             total_events_value = ga4_summary.get("total_events")
             if isinstance(total_events_value, (int, float, Decimal)):
@@ -597,10 +1176,14 @@ def build_summary_for_range(
 
         return summary, filter_note
     except Exception as exc:
-        if db_session is not None and job_record is not None:
+        if db_enabled and db_session is not None and job_record is not None:
             job_record.status = "failed"
             job_record.error_message = str(exc)
             job_record.finished_at = _now_utc()
+            job_record.intraday_active = intraday_fallback_detected
+            if dataset_record is not None:
+                dataset_record.intraday_active = intraday_fallback_detected
+                db_session.add(dataset_record)
             try:
                 db_session.add(job_record)
                 db_session.commit()
@@ -614,11 +1197,14 @@ def build_summary_for_range(
             exc,
         )
         raise
+    finally:
+        _exit_csv_mode()
 
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     form_defaults = _load_form_defaults()
+    project_id, dataset_id = _split_dataset(str(form_defaults["dataset"]))
 
     summary: dict | None = None
     error_message: str | None = None
@@ -633,19 +1219,35 @@ def index():
         max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
         max_top_values=max(1, int(form_defaults["top_values"])),
     )
+    debug_mode = _env_bool("DEBUG_MODE", False)
+    selected_specific_date = ""
+    current_date_iso = _now_utc().date().isoformat()
+    force_refresh_checked = False
+    intraday_hint = ""
+    intraday_last_updated: str | None = None
+    intraday_last_updated_label: str | None = None
 
     try:
-        if is_configured():
+        if _use_database_persistence():
             try:
-                db_session = get_session()
+                db_session = persistence_service.get_session()
             except Exception as exc:  # noqa: BLE001
                 db_error = f"Database connection failed: {exc}"
                 logger.error(db_error)
         else:
-            logger.debug("DATABASE_URL not set; running without persistence.")
+            logger.debug("Persistence mode CSV; skipping database session acquisition.")
 
         if request.method == "POST":
-            selected_range = request.form.get("date_range", "today").lower()
+            custom_date_value = (request.form.get("custom_date") or "").strip()
+            selected_range_value = request.form.get("date_range", "today")
+            force_refresh_checked = _coerce_truthy(request.form.get("force_refresh"))
+            force_refresh = force_refresh_checked
+            if custom_date_value:
+                selected_specific_date = custom_date_value
+                selected_range = f"date:{custom_date_value}"
+            else:
+                selected_range = selected_range_value
+            selected_range = selected_range.lower()
             if request.form.get("action") != "generate":
                 return render_template(
                     "index.html",
@@ -654,19 +1256,65 @@ def index():
                     filter_note=None,
                     error_message=None,
                     selected_date_range=selected_range,
+                    selected_specific_date=selected_specific_date,
+                    current_date=current_date_iso,
+                    force_refresh_checked=force_refresh_checked,
                     summary_generated=False,
+                    debug_mode=debug_mode,
+                    intraday_hint=intraday_hint,
+                    intraday_last_updated=intraday_last_updated,
+                    intraday_last_updated_label=intraday_last_updated_label,
                 )
             if db_error and db_session is None:
                 error_message = db_error
             else:
                 try:
-                    summary, filter_note = build_summary_for_range(
-                        selected_range=selected_range,
-                        form_defaults=form_defaults,
-                        options=options,
-                        db_session=db_session,
-                    )
-                    summary_generated = True
+                    cached_result: CachedSummaryResult | None = None
+                    if (
+                        not force_refresh
+                        and _use_database_persistence()
+                        and db_session is not None
+                    ):
+                        artifacts = _find_cached_summary_artifacts(
+                            selected_range,
+                            project_id=project_id,
+                            dataset_id=dataset_id,
+                            session=db_session,
+                        )
+                        if artifacts is not None:
+                            cached_result = _assemble_summary_from_report(artifacts)
+                            if cached_result is not None:
+                                logger.info(
+                                    "Reused cached summary for %s.%s range=%s job=%s",
+                                    project_id,
+                                    dataset_id,
+                                    selected_range,
+                                    cached_result.job.id,
+                                )
+                    if cached_result is not None:
+                        summary = cached_result.summary
+                        filter_note = cached_result.filter_note
+                        summary_generated = True
+                    else:
+                        summary, filter_note = build_summary_for_range(
+                            selected_range=selected_range,
+                            form_defaults=form_defaults,
+                            options=options,
+                            db_session=db_session if _use_database_persistence() else None,
+                            force_refresh=force_refresh,
+                        )
+                        summary_generated = True
+                    if summary_generated:
+                        fallback_flag = (
+                            cached_result.job.intraday_active
+                            if cached_result is not None and cached_result.job is not None
+                            else None
+                        )
+                        intraday_hint = _intraday_hint(summary, fallback_flag)
+                        intraday_last_updated, intraday_last_updated_label = _resolve_intraday_timestamp_payload(
+                            summary,
+                            job=cached_result.job if cached_result is not None else None,
+                        )
                 except IntradayTableNotFound as exc:
                     error_message = f"{exc} Hint: try another --intraday-date or tick 'All tables'."
                     logger.warning(error_message)
@@ -686,6 +1334,9 @@ def index():
         if db_error and not error_message:
             error_message = db_error
 
+        if not selected_specific_date and selected_range.startswith("date:"):
+            selected_specific_date = selected_range.split(":", 1)[1]
+
         return render_template(
             "index.html",
             form=form_defaults,
@@ -693,7 +1344,14 @@ def index():
             filter_note=filter_note,
             error_message=error_message,
             selected_date_range=selected_range,
+            selected_specific_date=selected_specific_date,
+            current_date=current_date_iso,
+            force_refresh_checked=force_refresh_checked,
             summary_generated=summary_generated,
+            debug_mode=debug_mode,
+            intraday_hint=intraday_hint,
+            intraday_last_updated=intraday_last_updated,
+            intraday_last_updated_label=intraday_last_updated_label,
         )
     finally:
         if db_session is not None:
@@ -701,17 +1359,89 @@ def index():
             logger.debug("Closed request-scoped database session.")
 
 
+@app.post("/api/check-summary")
+def check_summary():
+    payload = request.get_json(silent=True) or {}
+    date_str = str(payload.get("date") or "").strip()
+    if not date_str:
+        return jsonify({"error": "Missing date value."}), 400
+
+    normalized_range = f"date:{date_str}".lower()
+    form_defaults = _load_form_defaults()
+    project_id, dataset_id = _split_dataset(str(form_defaults["dataset"]))
+    intraday_prefix = str(form_defaults["intraday_prefix"])
+
+    try:
+        exports, _, summary_csv_path = _resolve_exports(
+            normalized_range,
+            now=_now_utc(),
+            project_id=project_id,
+            dataset_id=dataset_id,
+            week_days=int(form_defaults["week_days"]),
+            intraday_prefix=intraday_prefix,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    def _path_exists(path_like: Path | str) -> bool:
+        candidate = path_like if isinstance(path_like, Path) else Path(str(path_like))
+        return candidate.exists()
+
+    paths_available = all(_path_exists(export["csv_path"]) for export in exports)
+    summary_available = _path_exists(summary_csv_path)
+    available = paths_available or summary_available
+
+    db_summary_available = False
+    cached_finished_at: datetime | None = None
+    if persistence_service.is_database_mode():
+        session: Session | None = None
+        try:
+            session = persistence_service.get_session()
+            artifacts = _find_cached_summary_artifacts(
+                normalized_range,
+                project_id=project_id,
+                dataset_id=dataset_id,
+                session=session,
+            )
+            if artifacts is not None:
+                db_summary_available = True
+                cached_finished_at = artifacts.job.finished_at
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to check database summary availability: %s", exc)
+        finally:
+            if session is not None:
+                session.close()
+    available = available or db_summary_available
+
+    return jsonify(
+        {
+            "available": available,
+            "range_key": normalized_range,
+            "has_local_cache": paths_available or summary_available,
+            "has_database_summary": db_summary_available,
+            "last_completed_at": cached_finished_at.isoformat() if cached_finished_at else None,
+        }
+    )
+
+
 @app.post("/api/progress-summary")
 def progress_summary() -> Response:
     payload = request.get_json(silent=True) or {}
-    selected_range = str(payload.get("date_range") or "today").lower()
+    selected_range = str(payload.get("date_range") or "today")
+    custom_date = str(payload.get("custom_date") or "").strip()
+    if custom_date:
+        selected_range = f"date:{custom_date}"
+    selected_range = selected_range.lower()
+    force_refresh = _coerce_truthy(payload.get("force_refresh"))
     form_defaults = _load_form_defaults()
+    project_id, dataset_id = _split_dataset(str(form_defaults["dataset"]))
     options = DatasetSummaryOptions(
         location=(form_defaults["location"] or None),
         max_numeric_columns=max(0, int(form_defaults["max_numeric"])),
         max_categorical_columns=max(0, int(form_defaults["max_categorical"])),
         max_top_values=max(1, int(form_defaults["top_values"])),
     )
+    debug_mode = _env_bool("DEBUG_MODE", False)
 
     event_queue: SimpleQueue[dict | None] = SimpleQueue()
 
@@ -736,20 +1466,104 @@ def progress_summary() -> Response:
         try:
             with app.app_context():
                 logger.info("Worker started for range=%s", selected_range)
-                if is_configured():
+                if _use_database_persistence():
                     try:
-                        session = get_session()
+                        session = persistence_service.get_session()
                     except Exception as exc:  # noqa: BLE001
                         enqueue({"type": "error", "message": f"Database connection failed: {exc}"})
                         logger.error("Worker failed to acquire DB session: %s", exc)
                         return
+                if (
+                    not force_refresh
+                    and _use_database_persistence()
+                    and session is not None
+                ):
+                    artifacts = _find_cached_summary_artifacts(
+                        selected_range,
+                        project_id=project_id,
+                        dataset_id=dataset_id,
+                        session=session,
+                    )
+                    if artifacts is not None:
+                        cached_result = _assemble_summary_from_report(artifacts)
+                        if cached_result is not None:
+                            enqueue(
+                                {
+                                    "type": "status",
+                                    "stage": "cache",
+                                    "message": "Loading cached summary…",
+                                    "progress": 0.2,
+                                }
+                            )
+                            enqueue(
+                                {
+                                    "type": "note",
+                                    "message": cached_result.filter_note,
+                                    "progress": 0.65,
+                                }
+                            )
+                            intraday_hint_value = _intraday_hint(
+                                cached_result.summary,
+                                cached_result.job.intraday_active if cached_result.job else None,
+                            )
+                            (
+                                intraday_last_updated_value,
+                                intraday_last_updated_label,
+                            ) = _resolve_intraday_timestamp_payload(
+                                cached_result.summary,
+                                job=cached_result.job,
+                            )
+                            summary_html = render_template(
+                                "summary_content.html",
+                                summary=cached_result.summary,
+                                filter_note=cached_result.filter_note,
+                                error_message=None,
+                                summary_generated=True,
+                                selected_date_range=selected_range,
+                                form=form_defaults,
+                                debug_mode=debug_mode,
+                                intraday_hint=intraday_hint_value,
+                                intraday_last_updated=intraday_last_updated_value,
+                                intraday_last_updated_label=intraday_last_updated_label,
+                            )
+                            enqueue(
+                                {
+                                    "type": "status",
+                                    "stage": "cache",
+                                    "message": "Cached summary ready.",
+                                    "progress": 0.95,
+                                }
+                            )
+                            enqueue(
+                                {
+                                    "type": "complete",
+                                    "html": summary_html,
+                                    "hint": intraday_hint_value,
+                                    "intraday_last_updated": intraday_last_updated_value,
+                                    "intraday_last_updated_label": intraday_last_updated_label,
+                                }
+                            )
+                            logger.info(
+                                "Worker reused cached summary for %s.%s range=%s job=%s",
+                                project_id,
+                                dataset_id,
+                                selected_range,
+                                cached_result.job.id,
+                            )
+                            return
                 summary, filter_note = build_summary_for_range(
                     selected_range=selected_range,
                     form_defaults=form_defaults,
                     options=options,
                     progress_callback=progress_cb,
-                    db_session=session,
+                    db_session=session if _use_database_persistence() else None,
+                    force_refresh=force_refresh,
                 )
+                intraday_hint_value = _intraday_hint(summary)
+                (
+                    intraday_last_updated_value,
+                    intraday_last_updated_label,
+                ) = _resolve_intraday_timestamp_payload(summary)
                 summary_html = render_template(
                     "summary_content.html",
                     summary=summary,
@@ -758,8 +1572,20 @@ def progress_summary() -> Response:
                     summary_generated=True,
                     selected_date_range=selected_range,
                     form=form_defaults,
+                    debug_mode=debug_mode,
+                    intraday_hint=intraday_hint_value,
+                    intraday_last_updated=intraday_last_updated_value,
+                    intraday_last_updated_label=intraday_last_updated_label,
                 )
-            enqueue({"type": "complete", "html": summary_html})
+            enqueue(
+                {
+                    "type": "complete",
+                    "html": summary_html,
+                    "hint": intraday_hint_value,
+                    "intraday_last_updated": intraday_last_updated_value,
+                    "intraday_last_updated_label": intraday_last_updated_label,
+                }
+            )
         except IntradayTableNotFound as exc:
             enqueue({"type": "error", "message": f"{exc} Hint: try another date range or enable all tables."})
         except FileNotFoundError as exc:
@@ -792,4 +1618,5 @@ def progress_summary() -> Response:
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    # Bind to all interfaces so the app works in container/remote dev setups.
+    app.run(debug=True, host="0.0.0.0", port=5500)

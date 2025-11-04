@@ -1,5 +1,5 @@
-{% if filter_note %}
-  <div class="note">{{ filter_note }}</div>
+{% if filter_note and debug_mode %}
+  <div class="debug_notes">{{ filter_note }}</div>
 {% endif %}
 
 {% if summary %}
@@ -45,6 +45,34 @@
         {% endif %}
       </section>
     {% endfor %}
+
+    {% set product_stats = summary.product_purchase_stats %}
+    {% if product_stats and product_stats.most_purchased %}
+      <section>
+        <h2>Product purchase highlights</h2>
+        {% if product_stats.most_purchased %}
+          <h3>Most purchased products</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Product</th>
+                <th>Units sold</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in product_stats.most_purchased %}
+                <tr>
+                  <td>{{ loop.index }}</td>
+                  <td>{{ item.name }}</td>
+                  <td>{{ item.count }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+      </section>
+    {% endif %}
 
     {% if summary.csv_report_text %}
       <details>

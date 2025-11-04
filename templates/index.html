@@ -6,15 +6,95 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 2rem; }
     h1 { margin-bottom: 0.5rem; }
-    form { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 6px; display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
-    .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 200px; }
-    .form-field label { font-weight: bold; margin-bottom: 0; }
-    select { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
+    form {
+      margin-bottom: 2rem;
+      padding: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      display: grid;
+      gap: 1rem 1.25rem;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      align-items: start;
+    }
+    .form-field, .form-actions { width: 100%; }
+    .form-field { display: flex; flex-direction: column; gap: 0.4rem; min-width: 220px; }
+    .form-field > label { font-weight: bold; margin-bottom: 0; }
+    .form-field small { color: #555; font-size: 0.85rem; }
+    .form-field__heading { font-weight: 700; font-size: 0.95rem; color: #111827; }
+    .form-field--checkbox { flex-direction: column; align-items: flex-start; padding-top: 0.3rem; align-self: start; gap: 0.6rem; }
+    .form-field--checkbox input[type="checkbox"] { margin: 0; }
+    .form-actions { display: flex; flex-direction: column; justify-content: flex-start; gap: 0.6rem; min-width: 220px; align-self: start; }
+    .form-actions button { padding: 0.55rem 1.25rem; border-radius: 4px; border: none; background: #1976d2; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.2s ease; }
+    .form-actions button:hover { background: #125aa3; }
+    .form-actions button:disabled { background: #9dbce2; cursor: not-allowed; }
+    .button-row { display: inline-flex; align-items: center; gap: 0.6rem; }
+    .info-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.25rem;
+      height: 1.25rem;
+      border-radius: 50%;
+      border: 1px solid #4b5563;
+      color: #4b5563;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: help;
+      position: relative;
+      background: #fff;
+    }
+    .info-icon::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      bottom: 140%;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1f2937;
+      color: #fff;
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      line-height: 1.2;
+      white-space: normal;
+      min-width: 12rem;
+      max-width: 18rem;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      z-index: 5;
+    }
+    .info-icon::before {
+      content: '';
+      position: absolute;
+      bottom: 115%;
+      left: 50%;
+      transform: translateX(-50%);
+      border-width: 6px;
+      border-style: solid;
+      border-color: #1f2937 transparent transparent transparent;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+      z-index: 5;
+    }
+    .info-icon:hover::after,
+    .info-icon:focus-visible::after,
+    .info-icon:hover::before,
+    .info-icon:focus-visible::before {
+      opacity: 1;
+      transform: translateX(-50%) translateY(-2px);
+    }
+    .info-icon:focus-visible {
+      outline: 2px solid #1976d2;
+      outline-offset: 2px;
+    }
+    .checkbox-row { display: inline-flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; row-gap: 0.4rem; }
+    .checkbox-label { font-weight: 600; display: inline-flex; align-items: center; }
+    select, input[type="date"] { padding: 0.4rem; border: 1px solid #bbb; border-radius: 4px; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
     th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; vertical-align: top; }
     th { background-color: #f0f0f0; }
     .error { color: #b00020; margin-bottom: 1rem; }
-    .note { color: #00695c; margin-bottom: 1rem; }
+    .debug_notes { color: #00695c; margin-bottom: 1rem; }
     details { margin-bottom: 1.5rem; }
     summary { font-weight: bold; cursor: pointer; }
     code { background-color: #f6f8fa; padding: 0.1rem 0.3rem; border-radius: 3px; }
@@ -41,6 +121,26 @@
     .progress-steps li { position: relative; padding-left: 1.2rem; }
     .progress-steps li::before { content: '•'; position: absolute; left: 0; color: #1976d2; }
     .is-loading { opacity: 0.5; transition: opacity 0.2s ease; }
+    .summary-output { border: 1px solid #d0d7de; border-radius: 6px; padding: 1.25rem; background: #fff; min-height: 4rem; transition: opacity 0.2s ease; }
+    .summary-placeholder { color: #4b5563; font-size: 0.95rem; }
+    .summary-callout { background: #e8f2ff; border: 1px solid #b6d4fe; border-radius: 4px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #0b3d91; font-weight: 600; }
+    .summary-callout small { display: block; margin-top: 0.35rem; font-weight: 400; color: #0b3d91; opacity: 0.85; }
+    .intraday-timer { display: block; font-weight: 500; font-size: 0.9rem; color: #0b3d91; }
+    .intraday-timer [data-timer-value] { font-variant-numeric: tabular-nums; font-weight: 700; }
+    .form-field--timer { display: flex; align-items: stretch; }
+    .intraday-timer--inline {
+      background: #fef3c7;
+      border: 1px solid #fcd34d;
+      border-radius: 6px;
+      padding: 0.85rem 0.8rem;
+      color: #92400e;
+      display: grid;
+      gap: 0.3rem;
+      width: 70%;
+      box-shadow: 0 1px 2px rgba(17, 24, 39, 0.08);
+    }
+    .intraday-timer__heading { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #b45309; }
+    .intraday-timer__body { font-size: 1rem; font-weight: 500; color: inherit; }
   </style>
 </head>
 <body>
@@ -64,7 +164,79 @@
         </option>
       </select>
     </div>
-    <button type="submit" name="action" value="generate">Generate summary</button>
+    <div class="form-field">
+      <label for="custom_date">Specific date</label>
+      <input
+        type="date"
+        id="custom_date"
+        name="custom_date"
+        value="{% if selected_specific_date %}{{ selected_specific_date }}{% endif %}"
+        max="{{ current_date }}"
+        aria-describedby="custom-date-hint"
+      />
+      <small id="custom-date-hint">Leave blank to use the date range above.</small>
+    </div>
+    <div class="form-field form-field--checkbox">
+      <span class="form-field__heading">Force refresh</span>
+      <div class="checkbox-row">
+        <input
+          type="checkbox"
+          id="force_refresh"
+          name="force_refresh"
+          {% if force_refresh_checked %}checked{% endif %}
+        />
+        <label class="checkbox-label" for="force_refresh">Pull fresh data</label>
+        <span
+          class="info-icon"
+          tabindex="0"
+          aria-label="Skip cached summaries and pull fresh data when selected."
+          data-tooltip="Skip cached summaries and pull fresh data when selected."
+          title="Skip cached summaries and pull fresh data when selected."
+        >i</span>
+      </div>
+    </div>
+    <div class="form-field form-field--timer">
+      {% if intraday_last_updated %}
+        <div
+          class="intraday-timer intraday-timer--inline"
+          data-intraday-timer-inline
+          data-intraday-timer="{{ intraday_last_updated }}"
+          title="Updated {{ intraday_last_updated }}"
+        >
+          <span class="intraday-timer__heading">Intraday snapshot</span>
+          <span class="intraday-timer__body">
+            Last updated
+            <span data-timer-value>{{ intraday_last_updated_label or "just now" }}</span>
+          </span>
+        </div>
+      {% else %}
+        <div
+          class="intraday-timer intraday-timer--inline"
+          data-intraday-timer-inline
+          hidden
+          aria-hidden="true"
+        >
+          <span class="intraday-timer__heading">Intraday snapshot</span>
+          <span class="intraday-timer__body">
+            Last updated
+            <span data-timer-value>—</span>
+          </span>
+        </div>
+      {% endif %}
+    </div>
+    <div class="form-actions">
+      <span class="form-field__heading">Actions</span>
+      <div class="button-row">
+        <button type="submit" name="action" value="generate">Generate summary</button>
+        <span
+          class="info-icon"
+          tabindex="0"
+          aria-label="We will fetch the latest data and update you on the progress."
+          data-tooltip="We will fetch the latest data and let you know how things are progressing."
+          title="We will fetch the latest data and let you know how things are progressing."
+        >i</span>
+      </div>
+    </div>
   </form>
 
   <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
@@ -75,9 +247,29 @@
     <ul class="progress-steps" id="progress-steps" aria-live="polite" aria-atomic="false"></ul>
   </section>
 
-  <div id="summary-output">
+  <div id="summary-output" class="summary-output">
     {% if summary_generated and summary %}
+      <div class="summary-callout" role="status">
+        Summary ready! Scroll down to explore the highlights below.
+        {% if intraday_hint %}
+          <small>{{ intraday_hint }}</small>
+        {% endif %}
+        {% if intraday_last_updated %}
+          <small
+            class="intraday-timer"
+            data-intraday-timer="{{ intraday_last_updated }}"
+            title="Updated {{ intraday_last_updated }}"
+          >
+            Intraday snapshot last updated
+            <span data-timer-value>{{ intraday_last_updated_label or "just now" }}</span>.
+          </small>
+        {% endif %}
+      </div>
       {% include "summary_content.html" %}
+    {% else %}
+      <div class="summary-placeholder">
+        Choose a date range and generate a summary to see the latest insights here.
+      </div>
     {% endif %}
   </div>
 
@@ -114,6 +306,7 @@
 
       document.addEventListener('DOMContentLoaded', function () {
         attachToggleHandlers(document);
+        initIntradayTimers(document);
       });
 
       var form = document.querySelector('[data-summary-form]');
@@ -129,22 +322,70 @@
       var progressSteps = document.getElementById('progress-steps');
       var summaryOutput = document.getElementById('summary-output');
       var errorContainer = document.getElementById('error-container');
+      var dateRangeSelect = form.querySelector('#date_range');
+      var customDateInput = form.querySelector('#custom_date');
+      var forceRefreshInput = form.querySelector('#force_refresh');
 
       form.addEventListener('submit', function (event) {
         event.preventDefault();
+        var specificDate = customDateInput && customDateInput.value ? customDateInput.value : '';
+        var rangeValue = specificDate ? 'date:' + specificDate : (dateRangeSelect ? dateRangeSelect.value : 'today');
+        var forceRefresh = forceRefreshInput && forceRefreshInput.checked;
+        startSummaryRequest(
+          {
+            date_range: rangeValue,
+            custom_date: specificDate || undefined,
+            force_refresh: forceRefresh
+          },
+          {
+            checkAvailability: !forceRefresh && Boolean(specificDate),
+            forceRefresh: forceRefresh
+          }
+        );
+      });
+
+      async function startSummaryRequest(payload, options) {
+        var opts = options || {};
+        var specificDate = payload && payload.custom_date ? String(payload.custom_date) : '';
+        var forceRefresh = Boolean(opts.forceRefresh);
+        errorContainer.innerHTML = '';
+        var availability;
+
+        if (forceRefresh) {
+          payload.force_refresh = true;
+        }
+
+        if (!forceRefresh && specificDate && opts.checkAvailability !== false) {
+          try {
+            availability = await checkSummaryAvailability(specificDate);
+          } catch (availabilityError) {
+            showError(
+              availabilityError && availabilityError.message
+                ? availabilityError.message
+                : 'Unable to verify summary availability.'
+            );
+            return;
+          }
+          if (availability && availability.range_key) {
+            payload.date_range = availability.range_key;
+          }
+          if (!availability || availability.available !== true) {
+            var confirmMessage = 'No cached summary found for ' + specificDate + '. Connect to BigQuery and fetch it now?';
+            var shouldProceed = window.confirm(confirmMessage);
+            if (!shouldProceed) {
+              return;
+            }
+          }
+        }
+
         if (submitButton) {
           submitButton.disabled = true;
         }
-        errorContainer.innerHTML = '';
         progressSteps.innerHTML = '';
         progressPanel.hidden = false;
         summaryOutput.classList.add('is-loading');
         updateProgress(0.02, 'Preparing summary request…');
-
-        var rangeSelect = form.querySelector('#date_range');
-        var payload = {
-          date_range: rangeSelect ? rangeSelect.value : 'today'
-        };
+        updateInlineTimer(null, null);
 
         fetchSummary(payload)
           .catch(function (error) {
@@ -156,7 +397,33 @@
               submitButton.disabled = false;
             }
           });
-      });
+      }
+
+      async function checkSummaryAvailability(dateValue) {
+        var response;
+        try {
+          response = await fetch('/api/check-summary', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: dateValue })
+          });
+        } catch (networkError) {
+          throw new Error('Network error while checking summary availability.');
+        }
+
+        var payload = null;
+        try {
+          payload = await response.json();
+        } catch (parseError) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          var message = payload && payload.error ? payload.error : 'Failed to check summary availability.';
+          throw new Error(message);
+        }
+        return payload || {};
+      }
 
       function updateProgress(progressValue, message) {
         var value = Math.max(0, Math.min(progressValue || 0, 1));
@@ -184,10 +451,167 @@
         errorContainer.appendChild(errorBlock);
       }
 
-      function renderSummary(html) {
-        if (typeof html === 'string') {
-          summaryOutput.innerHTML = html;
-          attachToggleHandlers(summaryOutput);
+      function parseIsoDate(value) {
+        if (value === null || value === undefined) {
+          return null;
+        }
+        var date = new Date(String(value));
+        if (Number.isNaN ? Number.isNaN(date.getTime()) : isNaN(date.getTime())) {
+          return null;
+        }
+        return date;
+      }
+
+      function formatElapsedLabel(date) {
+        var diffMs = Date.now() - date.getTime();
+        if (diffMs < 0) {
+          diffMs = 0;
+        }
+        var totalSeconds = Math.floor(diffMs / 1000);
+        if (totalSeconds < 60) {
+          return totalSeconds + 's ago';
+        }
+        var minutes = Math.floor(totalSeconds / 60);
+        var seconds = totalSeconds % 60;
+        if (minutes < 60) {
+          var paddedSeconds = seconds < 10 ? '0' + seconds : String(seconds);
+          return minutes + 'm ' + paddedSeconds + 's ago';
+        }
+        var hours = Math.floor(minutes / 60);
+        minutes = minutes % 60;
+        if (hours < 24) {
+          var paddedMinutes = minutes < 10 ? '0' + minutes : String(minutes);
+          return hours + 'h ' + paddedMinutes + 'm ago';
+        }
+        var days = Math.floor(hours / 24);
+        hours = hours % 24;
+        return days + 'd ' + hours + 'h ago';
+      }
+
+      function initIntradayTimers(root) {
+        var scope = root || document;
+        scope.querySelectorAll('[data-intraday-timer]').forEach(function (node) {
+          var isoValue = node.getAttribute('data-intraday-timer');
+          if (!isoValue) {
+            return;
+          }
+          var timestamp = parseIsoDate(isoValue);
+          if (!timestamp) {
+            return;
+          }
+          var isoKey = timestamp.toISOString();
+          if (node.dataset.timerIso === isoKey && node.dataset.timerBound === 'true') {
+            return;
+          }
+          if (node.dataset.timerInterval) {
+            window.clearInterval(Number(node.dataset.timerInterval));
+            delete node.dataset.timerInterval;
+          }
+          node.dataset.timerIso = isoKey;
+          node.dataset.timerBound = 'true';
+          var valueNode = node.querySelector('[data-timer-value]');
+          if (!valueNode) {
+            valueNode = document.createElement('span');
+            valueNode.setAttribute('data-timer-value', '');
+            node.appendChild(valueNode);
+          }
+          node.setAttribute('title', timestamp.toLocaleString());
+          function updateTimer() {
+            if (!document.body.contains(node)) {
+              if (node.dataset.timerInterval) {
+                window.clearInterval(Number(node.dataset.timerInterval));
+                delete node.dataset.timerInterval;
+              }
+              return;
+            }
+            valueNode.textContent = formatElapsedLabel(timestamp);
+          }
+          updateTimer();
+          var intervalId = window.setInterval(updateTimer, 1000);
+          node.dataset.timerInterval = String(intervalId);
+        });
+      }
+
+      function updateInlineTimer(timerIso, timerLabel) {
+        var timerEl = document.querySelector('[data-intraday-timer-inline]');
+        if (!timerEl) {
+          return;
+        }
+        var existingInterval = timerEl.dataset.timerInterval;
+        if (existingInterval) {
+          window.clearInterval(Number(existingInterval));
+          delete timerEl.dataset.timerInterval;
+        }
+        timerEl.dataset.timerBound = '';
+        timerEl.dataset.timerIso = '';
+        if (!timerIso) {
+          timerEl.removeAttribute('data-intraday-timer');
+          timerEl.setAttribute('aria-hidden', 'true');
+          timerEl.hidden = true;
+          var placeholder = timerEl.querySelector('[data-timer-value]');
+          if (placeholder) {
+            placeholder.textContent = '—';
+          }
+          timerEl.removeAttribute('title');
+          return;
+        }
+        timerEl.hidden = false;
+        timerEl.removeAttribute('aria-hidden');
+        timerEl.setAttribute('data-intraday-timer', timerIso);
+        timerEl.setAttribute('title', 'Updated ' + timerIso);
+        var valueNode = timerEl.querySelector('[data-timer-value]');
+        if (!valueNode) {
+          valueNode = document.createElement('span');
+          valueNode.setAttribute('data-timer-value', '');
+          timerEl.appendChild(valueNode);
+        }
+        valueNode.textContent = timerLabel || 'just now';
+        initIntradayTimers();
+      }
+
+      function createSummaryCallout(hint, timerIso, timerLabel) {
+        var callout = document.createElement('div');
+        callout.className = 'summary-callout';
+        callout.setAttribute('role', 'status');
+        callout.textContent = 'Summary ready! Scroll down to explore the highlights below.';
+        if (hint) {
+          var hintEl = document.createElement('small');
+          hintEl.textContent = hint;
+          callout.appendChild(hintEl);
+        }
+        if (timerIso) {
+          var timerEl = document.createElement('small');
+          timerEl.className = 'intraday-timer';
+          timerEl.setAttribute('data-intraday-timer', timerIso);
+          var labelDate = parseIsoDate(timerIso);
+          var labelText = timerLabel || 'just now';
+          timerEl.appendChild(document.createTextNode('Intraday snapshot last updated '));
+          var valueEl = document.createElement('span');
+          valueEl.setAttribute('data-timer-value', '');
+          valueEl.textContent = labelText;
+          timerEl.appendChild(valueEl);
+          timerEl.appendChild(document.createTextNode('.'));
+          if (labelDate) {
+            timerEl.setAttribute('title', labelDate.toLocaleString());
+          }
+          callout.appendChild(timerEl);
+        }
+        return callout;
+      }
+
+      function renderSummary(html, hint, timerIso, timerLabel) {
+        if (typeof html !== 'string') {
+          progressPanel.hidden = true;
+          return;
+        }
+        summaryOutput.innerHTML = '';
+        summaryOutput.appendChild(createSummaryCallout(hint, timerIso, timerLabel));
+        summaryOutput.insertAdjacentHTML('beforeend', html);
+        attachToggleHandlers(summaryOutput);
+        updateInlineTimer(timerIso, timerLabel);
+        initIntradayTimers(summaryOutput);
+        if (typeof summaryOutput.scrollIntoView === 'function') {
+          summaryOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
         progressPanel.hidden = true;
       }
@@ -243,8 +667,13 @@
               addStep(eventData.message);
             } else if (eventData.type === 'complete') {
               completed = true;
-              updateProgress(1, 'Summary ready.');
-              renderSummary(eventData.html);
+              updateProgress(1, 'All set! Your summary is ready.');
+              renderSummary(
+                eventData.html,
+                eventData.hint,
+                eventData.intraday_last_updated,
+                eventData.intraday_last_updated_label
+              );
             } else if (eventData.type === 'error') {
               errorMessage = eventData.message || 'Summary generation failed.';
             }
