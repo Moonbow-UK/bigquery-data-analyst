@@ -180,6 +180,8 @@ The page displays dataset metadata, a table overview, and per-table drill-down s
 
 Daily run logs land under `var/logs/` with filenames prefixed by the UTC date (for example `2025-11-04-app.log`). Cached summary reuse and BigQuery refreshes are annotated there, making it easy to confirm when the app serves previously generated reports.
 
+CSV and JSON exports now live under `var/exports/` (`var/exports/csv` and `var/exports/json`). Legacy files in the project root are moved automatically the first time they are referenced.
+
 ### AI Advisor bootstrap (Pinecone + OpenAI)
 
 Add the following environment variables (via `.env` or your shell) before running the manual ingestion command or enabling the chat assistant:
@@ -205,6 +207,31 @@ python3 scripts/ingest_pinecone.py --range all --dry-run  # preview without upse
 ```
 
 The script loads completed summary jobs, embeds the full summary JSON payload, and upserts the vectors (with metadata) into the configured Pinecone namespace.
+
+### Resetting or pruning cached summaries
+
+Use the management helper under `scripts/manage_summaries.py` to clean out the persistence tables:
+
+```bash
+# Drop duplicate jobs and keep only the most recent per dataset/range
+python3 scripts/manage_summaries.py
+
+# Preview actions without mutating the database
+python3 scripts/manage_summaries.py --dry-run
+
+# Wipe all summary jobs/exports/reports for a fresh start
+python3 scripts/manage_summaries.py --reset
+```
+
+Each new summary run now deletes any prior rows for the same dataset + range before storing fresh results, so the tables stay at a single entry per date going forward.
+
+To backfill daily summaries over a window of dates without using `curl`, run:
+
+```bash
+python3 scripts/run_daily_summaries.py --start-date 2025-10-30 --days 7
+```
+
+The helper walks backwards from the start date (inclusive), triggers `/api/progress-summary` for each day, and skips dates that already have a completed entry unless you add `--force-refresh`. Pass `--auto-refresh-stale` to automatically refresh intraday exports whose CSV is older than two days (otherwise it will prompt), use `--verbose` to stream progress messages, and `--base-url` (defaults to `http://127.0.0.1:5500`) to target a remote deployment.
 
 ### HTTP API
 

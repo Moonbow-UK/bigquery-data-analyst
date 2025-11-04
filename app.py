@@ -106,6 +106,13 @@ class DailyPrefixedFileHandler(BaseRotatingHandler):
 
 
 LOG_DIR = Path("var/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+EXPORT_ROOT = Path("var/exports")
+CSV_EXPORT_DIR = EXPORT_ROOT / "csv"
+JSON_EXPORT_DIR = EXPORT_ROOT / "json"
+for export_dir in (CSV_EXPORT_DIR, JSON_EXPORT_DIR):
+    export_dir.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
@@ -123,6 +130,66 @@ logger.addHandler(stream_handler)
 logger.propagate = False
 
 persistence_service = PersistenceService(logger=logger.getChild("persistence"))
+
+
+def _csv_export_path(project_id: str, dataset_id: str, table_name: str) -> Path:
+    filename = f"{project_id}_{dataset_id}_{table_name}.csv"
+    legacy = Path(filename)
+    target = CSV_EXPORT_DIR / filename
+    if legacy.exists() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            logger.info("Migrated legacy CSV %s to %s", legacy, target)
+        except OSError as exc:
+            logger.warning("Unable to move legacy CSV %s to %s: %s", legacy, target, exc)
+    return target
+
+
+def _json_export_path(project_id: str, dataset_id: str, table_name: str) -> Path:
+    filename = f"{project_id}_{dataset_id}_{table_name}.json"
+    legacy = Path(filename)
+    target = JSON_EXPORT_DIR / filename
+    if legacy.exists() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            logger.info("Migrated legacy JSON %s to %s", legacy, target)
+        except OSError as exc:
+            logger.warning("Unable to move legacy JSON %s to %s: %s", legacy, target, exc)
+    return target
+
+
+def _purge_existing_summary_jobs(
+    session: Session,
+    dataset_record: Dataset,
+    range_key: str,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    exclude_job_id: uuid.UUID | None = None,
+) -> int:
+    stmt = select(SummaryJob).where(
+        SummaryJob.dataset_id == dataset_record.id,
+        SummaryJob.range_key == range_key,
+    )
+    if statuses is not None:
+        stmt = stmt.where(SummaryJob.status.in_(statuses))
+    if exclude_job_id is not None:
+        stmt = stmt.where(SummaryJob.id != exclude_job_id)
+    jobs = session.execute(stmt).scalars().all()
+    if not jobs:
+        return 0
+    for job in jobs:
+        session.delete(job)
+    session.commit()
+    logger.info(
+        "Removed %d existing summary job(s) for %s.%s range=%s",
+        len(jobs),
+        dataset_record.project_id,
+        dataset_record.dataset_id,
+        range_key,
+    )
+    return len(jobs)
 
 
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
@@ -440,8 +507,8 @@ def _resolve_exports(
         target_date = now
         date_str = target_date.strftime("%Y%m%d")
         table_name = f"{intraday_prefix}{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         exports = [
             {
                 "table_name": table_name,
@@ -456,11 +523,11 @@ def _resolve_exports(
         target_date = now - timedelta(days=1)
         date_str = target_date.strftime("%Y%m%d")
         table_name = f"events_{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         fallback_table_name = f"{intraday_prefix}{date_str}"
-        fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-        fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+        fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+        fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
         exports = [
             {
                 "table_name": table_name,
@@ -482,11 +549,11 @@ def _resolve_exports(
             target_date = now - timedelta(days=offset)
             date_str = target_date.strftime("%Y%m%d")
             table_name = f"events_{date_str}"
-            csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-            json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+            csv_path = _csv_export_path(project_id, dataset_id, table_name)
+            json_path = _json_export_path(project_id, dataset_id, table_name)
             fallback_table_name = f"{intraday_prefix}{date_str}"
-            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+            fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
             exports.append(
                 {
                     "table_name": table_name,
@@ -500,7 +567,11 @@ def _resolve_exports(
                     "fallback_json_path": fallback_json_path,
                 }
             )
-        summary_csv = Path(f"{project_id}_{dataset_id}_events_last{days_to_fetch}days.csv")
+        summary_csv = _csv_export_path(
+            project_id,
+            dataset_id,
+            f"events_last{days_to_fetch}days",
+        )
         day_label = "day" if days_to_fetch == 1 else "days"
         return exports, f"Last {days_to_fetch} {day_label}", summary_csv
     if normalized_key.startswith("date:"):
@@ -514,16 +585,16 @@ def _resolve_exports(
         date_str = target_date.strftime("%Y%m%d")
         is_today = target_date.date() == now.date()
         table_name = f"{intraday_prefix}{date_str}" if is_today else f"events_{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         fallback_table_name: str | None = None
         fallback_csv_path: Path | None = None
         fallback_json_path: Path | None = None
         fallback_full_table_id: str | None = None
         if not is_today:
             fallback_table_name = f"{intraday_prefix}{date_str}"
-            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+            fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
             fallback_full_table_id = f"{project_id}.{dataset_id}.{fallback_table_name}"
         exports = [
             {
@@ -826,6 +897,18 @@ def build_summary_for_range(
                     dataset_id,
                 )
             db_session.commit()
+
+            removed_jobs = _purge_existing_summary_jobs(
+                db_session,
+                dataset_record,
+                normalized_range,
+                statuses=("completed", "failed"),
+            )
+            if removed_jobs:
+                logger.debug(
+                    "Purged %d prior job(s) before creating new summary job.",
+                    removed_jobs,
+                )
 
             job_record = SummaryJob(
                 dataset_id=dataset_record.id,
@@ -1165,6 +1248,19 @@ def build_summary_for_range(
             db_session.add(report_record)
             db_session.add(job_record)
             db_session.commit()
+            removed_after = _purge_existing_summary_jobs(
+                db_session,
+                dataset_record,
+                normalized_range,
+                statuses=("completed", "failed"),
+                exclude_job_id=job_record.id,
+            )
+            if removed_after:
+                logger.debug(
+                    "Removed %d older completed job(s) after finishing job %s",
+                    removed_after,
+                    job_record.id,
+                )
             logger.info(
                 "Summary job %s completed successfully (events=%s)",
                 job_record.id,

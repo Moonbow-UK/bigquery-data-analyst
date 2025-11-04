@@ -8,21 +8,27 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Iterable
 
-import pinecone  # type: ignore[import]
 from openai import OpenAI
+from pinecone import Pinecone  # type: ignore[import]
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from bqtools.config import load_environment
-from bqtools.services.persistence import (
+from bqtools.services.persistence import (  # noqa: E402
     Dataset,
     PersistenceService,
     SummaryJob,
     SummaryReport,
 )
 
+MAX_EMBED_TEXT_CHARS = 20000
 LOGGER = logging.getLogger("pinecone_ingest")
 
 
@@ -79,6 +85,30 @@ def _load_jobs(
     return [job for job in jobs if job.report and job.report.raw_summary_json]
 
 
+def _prune_summary_payload(summary_payload: object) -> object:
+    if not isinstance(summary_payload, dict):
+        return summary_payload
+    pruned: dict[str, object] = {}
+    for key, value in summary_payload.items():
+        if key == "csv_sections" and isinstance(value, list):
+            trimmed_sections = []
+            for section in value[:5]:
+                if isinstance(section, dict):
+                    trimmed_section = dict(section)
+                    rows = trimmed_section.get("rows")
+                    if isinstance(rows, list):
+                        trimmed_section["rows"] = rows[:5]
+                    trimmed_sections.append(trimmed_section)
+            pruned[key] = trimmed_sections
+        elif key == "tables" and isinstance(value, list):
+            pruned[key] = value[:10]
+        elif key == "table_overview" and isinstance(value, list):
+            pruned[key] = value[:10]
+        else:
+            pruned[key] = value
+    return pruned
+
+
 def _serialise_summary(report: SummaryReport, job: SummaryJob, dataset: Dataset | None) -> str:
     summary_payload = report.raw_summary_json
     if isinstance(summary_payload, str):
@@ -87,6 +117,7 @@ def _serialise_summary(report: SummaryReport, job: SummaryJob, dataset: Dataset 
         except json.JSONDecodeError:
             LOGGER.warning("Stored summary JSON malformed for job %s", job.id)
             summary_payload = {"raw_summary": summary_payload}
+    summary_payload = _prune_summary_payload(summary_payload)
 
     body = {
         "dataset": (
@@ -99,7 +130,16 @@ def _serialise_summary(report: SummaryReport, job: SummaryJob, dataset: Dataset 
         "intraday_active": job.intraday_active,
         "summary": summary_payload,
     }
-    return json.dumps(body, sort_keys=True)
+    serialised = json.dumps(body, sort_keys=True)
+    if len(serialised) > MAX_EMBED_TEXT_CHARS:
+        LOGGER.warning(
+            "Embedding text for job %s exceeds limit (%d chars). Truncating to %d chars.",
+            job.id,
+            len(serialised),
+            MAX_EMBED_TEXT_CHARS,
+        )
+        serialised = serialised[:MAX_EMBED_TEXT_CHARS]
+    return serialised
 
 
 def _embed_text(client: OpenAI, model: str, text: str) -> list[float]:
@@ -154,7 +194,7 @@ def main() -> None:
         LOGGER.info("Preparing embeddings for %d job(s).", len(jobs))
         openai_client = OpenAI(api_key=openai_api_key)
 
-        vectors = []
+        vectors: list[dict[str, object]] = []
         for job in jobs:
             report = job.report
             dataset = job.dataset
@@ -171,15 +211,19 @@ def main() -> None:
                 "finished_at": job.finished_at.isoformat() if job.finished_at else None,
             }
             vectors.append(
-                (str(job.id), embedding, metadata)
+                {
+                    "id": str(job.id),
+                    "values": embedding,
+                    "metadata": metadata,
+                }
             )
 
         if args.dry_run:
             LOGGER.info("Dry run enabled – skipping Pinecone upsert.")
             return
 
-        pinecone.init(api_key=pinecone_api_key, environment=pinecone_env)
-        existing_indexes = pinecone.list_indexes()
+        pinecone_client = Pinecone(api_key=pinecone_api_key, environment=pinecone_env)
+        existing_indexes = pinecone_client.list_indexes().names()
         if pinecone_index_name not in existing_indexes:
             LOGGER.error(
                 "Pinecone index '%s' not found. Create it first (dimension should match %s embeddings).",
@@ -188,7 +232,7 @@ def main() -> None:
             )
             sys.exit(1)
 
-        index = pinecone.Index(pinecone_index_name)
+        index = pinecone_client.Index(pinecone_index_name)
         total = 0
         for batch in _batched(vectors, 50):
             index.upsert(vectors=batch, namespace=args.namespace)
