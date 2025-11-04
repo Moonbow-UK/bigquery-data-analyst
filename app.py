@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import os
+import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -845,6 +846,7 @@ def build_summary_for_range(
     project_override = str(form_defaults["project"]) if form_defaults["project"] else None
     credentials_path = str(form_defaults["credentials_file"]) if form_defaults["credentials_file"] else None
     week_days = int(form_defaults["week_days"])
+    job_week_days = week_days if normalized_range == "last7days" else 1
 
     external_progress_callback = progress_callback
     job_record: SummaryJob | None = None
@@ -913,7 +915,7 @@ def build_summary_for_range(
             job_record = SummaryJob(
                 dataset_id=dataset_record.id,
                 range_key=normalized_range,
-                week_days=week_days,
+                week_days=job_week_days,
                 status="running",
                 started_at=now,
                 progress=0.0,
