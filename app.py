@@ -783,7 +783,7 @@ def build_summary_for_range(
         if db_enabled and job_record and stage != "complete":
             try:
                 job_record.progress = float(progress_value)
-                if job_record.status != "running":
+                if job_record.status not in {"running", "completed", "failed"}:
                     job_record.status = "running"
                 db_session.add(job_record)  # type: ignore[union-attr]
                 db_session.commit()  # type: ignore[union-attr]
