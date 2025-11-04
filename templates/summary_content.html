@@ -47,7 +47,7 @@
     {% endfor %}
 
     {% set product_stats = summary.product_purchase_stats %}
-    {% if product_stats and (product_stats.most_purchased or product_stats.least_purchased) %}
+    {% if product_stats and product_stats.most_purchased %}
       <section>
         <h2>Product purchase highlights</h2>
         {% if product_stats.most_purchased %}
@@ -62,28 +62,6 @@
             </thead>
             <tbody>
               {% for item in product_stats.most_purchased %}
-                <tr>
-                  <td>{{ loop.index }}</td>
-                  <td>{{ item.name }}</td>
-                  <td>{{ item.count }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% endif %}
-
-        {% if product_stats.least_purchased %}
-          <h3>Least purchased products</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Product</th>
-                <th>Units sold</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for item in product_stats.least_purchased %}
                 <tr>
                   <td>{{ loop.index }}</td>
                   <td>{{ item.name }}</td>
