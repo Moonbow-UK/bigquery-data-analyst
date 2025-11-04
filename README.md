@@ -180,6 +180,32 @@ The page displays dataset metadata, a table overview, and per-table drill-down s
 
 Daily run logs land under `var/logs/` with filenames prefixed by the UTC date (for example `2025-11-04-app.log`). Cached summary reuse and BigQuery refreshes are annotated there, making it easy to confirm when the app serves previously generated reports.
 
+### AI Advisor bootstrap (Pinecone + OpenAI)
+
+Add the following environment variables (via `.env` or your shell) before running the manual ingestion command or enabling the chat assistant:
+
+```
+OPENAI_API_KEY=sk-...
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_EMBED_MODEL=text-embedding-3-small
+PINECONE_API_KEY=pc-...
+PINECONE_ENVIRONMENT=gcp-starter
+PINECONE_INDEX_NAME=ga4-summaries
+PINECONE_NAMESPACE=ga4
+```
+
+The free Pinecone “Starter” tier supports a single index in the `gcp-starter` environment running one `s1.x1` pod (max dimension 1536, which matches `text-embedding-3-small`). Upgrades are seamless—create a larger pod-based or serverless index with the same name/namespace and re-run the ingestion script to repopulate vectors.
+
+Once GA4 summaries exist in the PostgreSQL cache, trigger manual embedding syncs:
+
+```bash
+python3 scripts/ingest_pinecone.py --range today
+python3 scripts/ingest_pinecone.py --range last7days --limit 5
+python3 scripts/ingest_pinecone.py --range all --dry-run  # preview without upsert
+```
+
+The script loads completed summary jobs, embeds the full summary JSON payload, and upserts the vectors (with metadata) into the configured Pinecone namespace.
+
 ### HTTP API
 
 The Flask app also exposes a JSON API under `/api/summary`, powered by the same service layer. POST a payload to retrieve structured data (and optional pre-rendered text) suitable for chat/LLM integrations or dashboards:
