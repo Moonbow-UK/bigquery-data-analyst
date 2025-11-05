@@ -146,6 +146,16 @@ BIGQUERY_USE_CSV_FILE=/absolute/path/to/export.csv
 
 When enabled, `summarize_dataset.py` produces a GA4-style intraday digest: executive metrics (events, users, sessions, engagement), top events/pages, device and geo mixes, plus analyst highlights and next-step recommendations. The `--max-*` flags still control how many columns and top values are displayed, and the narrative mirrors the companion PDF.
 
+For unattended backfills across multiple days, use the range-aware helper:
+
+```bash
+python scripts/summarize_local_csvs.py --start-date 2025-10-24 --days 7
+```
+
+The script reuses the Flask app defaults, skips dates with missing exports (logging the skip), and persists summaries through the configured database. Add `--refresh-json` to regenerate the cached NDJSON files from existing CSVs without hitting BigQuery, or `--force-refresh` to rebuild the CSV/JSON exports end-to-end (may require BigQuery quota). Use `--all` to walk every dated CSV under `var/exports/csv` regardless of date, or `--end-date` when you prefer an explicit range instead of `--days`.
+
+Checksums are recorded in `var/exports/checksums.json` so the CLI can detect when an existing JSON export no longer matches its source CSV; mismatches are automatically refreshed. Opt out with `--skip-integrity-check` if you only want to touch files when explicitly requested. Combine any of the above with `--dry-run` to preview which dates would be processed and which JSON files would be regenerated without modifying the filesystem.
+
 ### Credential path configuration
 
 Both CLI tools (`bigquery.py`, `summarize_dataset.py`) and the web UI read the OAuth/service account JSON from:
