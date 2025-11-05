@@ -60,6 +60,24 @@ Notes:
 - For production usage prefer service-account credentials with the `google-cloud-bigquery` client.
 - The shared library layer makes it straightforward to add new surfaces (database writers, chat assistants, dashboards) without duplicating BigQuery plumbing.
 
+### Bulk intraday exports
+
+When you need a rolling 15-day window of GA4 intraday data, use the helper script:
+
+```bash
+chmod +x scripts/export_intraday_csvs.sh      # first run only
+./scripts/export_intraday_csvs.sh             # defaults to today (UTC)
+./scripts/export_intraday_csvs.sh 2025-10-31  # anchor the range explicitly
+```
+
+The script:
+- loads `.env` so `BIGQUERY_PROJECT_ID`, `BIGQUERY_DATASET_ID`, and credentials are available
+- writes one CSV per day into `var/exports/csv`
+- accepts an optional `YYYY-MM-DD` anchor date, then walks backwards 15 days
+- tries `${BIGQUERY_INTRADAY_PREFIX}` first and falls back to `events_YYYYMMDD` tables when needed
+
+Run it from the project root; otherwise the relative `var/exports/csv` path resolves under your current directory.
+
 ## Persistence adapters
 
 You can persist `BigQueryService` results with the adapters under `bqtools.persistence`.
