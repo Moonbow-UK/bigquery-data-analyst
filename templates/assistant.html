@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Euronics AI Assistant</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
+      --brand-blue: #0c5dbb;
+      --brand-blue-dark: #063e7c;
+      --bg-gradient: linear-gradient(180deg, #f5fbff 0%, #eaf3ff 100%);
+      --sidebar-gradient: linear-gradient(180deg, #0e4a89 0%, #072e55 100%);
+      --card-bg: #ffffffcc;
+      --shadow-sm: 0 12px 32px rgba(15, 67, 118, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg-gradient);
+      display: flex;
+      color: #0c223f;
+    }
+    aside {
+      width: 260px;
+      background: var(--sidebar-gradient);
+      padding: 32px 24px;
+      color: #f6fbff;
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+    .brand {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+    .nav {
+      display: grid;
+      gap: 12px;
+      font-weight: 500;
+      font-size: 0.95rem;
+    }
+    .nav__item {
+      opacity: 0.75;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .nav__item--active {
+      opacity: 1;
+      font-weight: 600;
+    }
+    main {
+      flex: 1;
+      padding: 48px clamp(24px, 4vw, 64px);
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+    .masthead {
+      text-align: center;
+      max-width: 780px;
+      margin: 0 auto;
+    }
+    .masthead h1 {
+      margin: 0 0 18px;
+      font-size: clamp(2rem, 4vw, 2.8rem);
+      font-weight: 700;
+      color: var(--brand-blue-dark);
+    }
+    .suggestion-chips {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .chip {
+      border-radius: 999px;
+      padding: 10px 18px;
+      background: rgba(12, 93, 187, 0.08);
+      color: var(--brand-blue);
+      font-size: 0.92rem;
+      cursor: pointer;
+      transition: background 0.2s ease, transform 0.2s ease;
+    }
+    .chip:hover {
+      background: rgba(12, 93, 187, 0.16);
+      transform: translateY(-1px);
+    }
+    .chat-shell {
+      margin: 0 auto;
+      width: min(100%, 880px);
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+    .chat-log {
+      display: grid;
+      gap: 16px;
+      padding: 24px;
+      border-radius: 32px;
+      background: var(--card-bg);
+      box-shadow: var(--shadow-sm);
+      min-height: 200px;
+    }
+    .message {
+      background: #fff;
+      border-radius: 24px;
+      padding: 18px 22px;
+      line-height: 1.55;
+      box-shadow: 0 8px 24px rgba(13, 57, 104, 0.08);
+    }
+    .message--user {
+      background: rgba(12, 93, 187, 0.12);
+      color: var(--brand-blue-dark);
+      margin-left: auto;
+      max-width: 80%;
+    }
+    .message--assistant {
+      border: 1px solid rgba(12, 93, 187, 0.1);
+      max-width: 100%;
+    }
+    .message strong {
+      color: var(--brand-blue);
+    }
+    .message footer {
+      margin-top: 16px;
+      font-size: 0.85rem;
+      color: #4b5d75;
+    }
+    .highlights {
+      margin: 12px 0;
+      padding-left: 1.2rem;
+      color: #10345f;
+    }
+    form.chat-input {
+      display: flex;
+      align-items: center;
+      padding: 14px 18px;
+      border-radius: 28px;
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+      gap: 14px;
+    }
+    form.chat-input textarea {
+      border: none;
+      resize: none;
+      flex: 1;
+      min-height: 48px;
+      font-size: 1rem;
+      outline: none;
+      font-family: inherit;
+      color: #0c223f;
+    }
+    form.chat-input button {
+      background: var(--brand-blue);
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      padding: 12px 26px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    form.chat-input button:disabled {
+      background: rgba(12, 93, 187, 0.45);
+      cursor: not-allowed;
+    }
+    .followups {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .followups button {
+      border: 1px solid rgba(12, 93, 187, 0.18);
+      background: rgba(12, 93, 187, 0.08);
+      color: var(--brand-blue);
+      border-radius: 999px;
+      padding: 8px 16px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    .followups button:hover {
+      background: rgba(12, 93, 187, 0.18);
+    }
+    @media (max-width: 900px) {
+      aside { display: none; }
+      body { background: var(--bg-gradient); }
+      main { padding: 32px 20px 60px; }
+      .chat-log {
+        border-radius: 24px;
+        padding: 18px;
+      }
+      form.chat-input {
+        flex-direction: column;
+        align-items: stretch;
+        border-radius: 24px;
+      }
+      form.chat-input button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <aside>
+    <div class="brand">euronics</div>
+    <nav class="nav">
+      <span class="nav__item">📊 Dashboard</span>
+      <span class="nav__item nav__item--active">🤖 AI Assistant</span>
+      <span class="nav__item">💡 Opportunities</span>
+    </nav>
+  </aside>
+  <main>
+    <section class="masthead">
+      <h1>Hello, {{ user_name }}</h1>
+      <p style="margin: 0; font-size: 1.05rem; color: #26527f;">
+        Ask anything about your GA4 intraday and daily summaries. I’ll surface the right insights and next steps.
+      </p>
+      <div class="suggestion-chips" id="suggestion-chips"></div>
+    </section>
+    <section class="chat-shell">
+      <div class="chat-log" id="chat-log">
+        <div class="message message--assistant" id="assistant-greeting">
+          Hi! I’m ready to analyse your GA4 summaries. Ask about conversion drops, cart abandonment, traffic trends, or anything else that matters today.
+        </div>
+      </div>
+      <form class="chat-input" id="chat-form" autocomplete="off">
+        <textarea
+          id="chat-question"
+          name="question"
+          placeholder="Ask the assistant..."
+          rows="1"
+          required
+        ></textarea>
+        <button type="submit" id="chat-submit">Send</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    const state = {
+      suggestions: {{ suggestions | tojson }},
+      followups: [],
+      isSubmitting: false,
+    };
+
+    const suggestionContainer = document.getElementById('suggestion-chips');
+    const chatLog = document.getElementById('chat-log');
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-question');
+    const chatSubmit = document.getElementById('chat-submit');
+
+    function renderChips(chips, container, clickHandler) {
+      container.innerHTML = '';
+      chips.forEach((label) => {
+        if (!label) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'chip';
+        button.textContent = label;
+        button.addEventListener('click', () => clickHandler(label));
+        container.appendChild(button);
+      });
+    }
+
+    function appendMessage(role, content, extras = {}) {
+      const bubble = document.createElement('article');
+      bubble.className = role === 'user' ? 'message message--user' : 'message message--assistant';
+      if (Array.isArray(content)) {
+        content.forEach((node) => bubble.appendChild(node));
+      } else {
+        bubble.textContent = content;
+      }
+      if (extras.highlights && extras.highlights.length) {
+        const list = document.createElement('ul');
+        list.className = 'highlights';
+        extras.highlights.forEach((item) => {
+          const li = document.createElement('li');
+          li.textContent = item;
+          list.appendChild(li);
+        });
+        bubble.appendChild(list);
+      }
+      if (extras.sources && extras.sources.length) {
+        const footer = document.createElement('footer');
+        footer.textContent = extras.sources
+          .map((src) => {
+            const labelParts = [];
+            if (src.range_key) labelParts.push(src.range_key);
+            if (src.finished_at) labelParts.push(new Date(src.finished_at).toLocaleString());
+            return labelParts.join(' • ');
+          })
+          .join(' | ');
+        bubble.appendChild(footer);
+      }
+      chatLog.appendChild(bubble);
+      chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'smooth' });
+      return bubble;
+    }
+
+    function buildAssistantNodes(answer) {
+      return answer.split(/\n{2,}/).map((paragraph) => {
+        const p = document.createElement('p');
+        p.textContent = paragraph.trim();
+        return p;
+      });
+    }
+
+    async function askAssistant(question) {
+      state.isSubmitting = true;
+      chatSubmit.disabled = true;
+      chatInput.disabled = true;
+      const userBubble = appendMessage('user', question);
+
+      const placeholder = document.createElement('span');
+      placeholder.textContent = 'Thinking…';
+      const pendingBubble = appendMessage('assistant', [placeholder]);
+
+      try {
+        const response = await fetch('/assistant/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || 'Assistant failed to respond.');
+        }
+        pendingBubble.remove();
+        appendMessage('assistant', buildAssistantNodes(payload.answer), {
+          highlights: payload.highlights,
+          sources: payload.sources,
+        });
+        state.followups = Array.isArray(payload.followups) ? payload.followups : [];
+        renderChips(state.followups, suggestionContainer, handleChipClick);
+      } catch (error) {
+        pendingBubble.remove();
+        appendMessage('assistant', `Sorry, I hit a snag: ${error.message}. Try again in a moment.`);
+      } finally {
+        state.isSubmitting = false;
+        chatSubmit.disabled = false;
+        chatInput.disabled = false;
+        chatInput.value = '';
+        chatInput.focus();
+      }
+      userBubble.classList.add('message--user');
+    }
+
+    function handleChipClick(label) {
+      if (state.isSubmitting) return;
+      chatInput.value = label;
+      chatForm.requestSubmit();
+    }
+
+    chatForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const question = chatInput.value.trim();
+      if (!question || state.isSubmitting) return;
+      askAssistant(question);
+    });
+
+    chatInput.addEventListener('input', () => {
+      chatInput.style.height = 'auto';
+      chatInput.style.height = `${chatInput.scrollHeight}px`;
+    });
+
+    renderChips(state.suggestions, suggestionContainer, handleChipClick);
+  </script>
+</body>
+</html>
