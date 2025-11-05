@@ -47,9 +47,17 @@ from bqtools.services.persistence import (
 
 load_environment()
 
+def _env_flag_from_str(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+DEBUG_MODE = _env_flag_from_str(os.environ.get("DEBUG_MODE"), False)
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "change-me")
 app.config["DEFAULT_CREDENTIALS_FILE"] = str(default_credentials_file())
+app.config["DEBUG"] = DEBUG_MODE
 
 
 summary_api = create_summary_blueprint(
@@ -120,7 +128,7 @@ for export_dir in (CSV_EXPORT_DIR, JSON_EXPORT_DIR):
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     file_handler = DailyPrefixedFileHandler(LOG_DIR, "app.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -132,6 +140,9 @@ if not logger.handlers:
     )
 logger.addHandler(stream_handler)
 logger.propagate = False
+
+if DEBUG_MODE:
+    logger.debug("Debug mode enabled for summary_app.")
 
 persistence_service = PersistenceService(logger=logger.getChild("persistence"))
 
@@ -1405,6 +1416,7 @@ def _query_similar_jobs(question: str) -> list[dict[str, Any]]:
                 "metadata": metadata,
             }
         )
+    logger.debug("Assistant Pinecone matches for '%s': %s", question, results)
     return results
 
 
@@ -1554,6 +1566,7 @@ def _generate_chat_response(question: str) -> dict[str, Any]:
         )
 
     if not contexts:
+        logger.debug("Assistant: no context assembled for question '%s' (matches=%s)", question, matches)
         return {
             "answer": (
                 "The assistant could not load the supporting summaries required to answer that question. "
@@ -1565,6 +1578,11 @@ def _generate_chat_response(question: str) -> dict[str, Any]:
         }
 
     context_text = "\n\n---\n\n".join(contexts)
+    logger.debug(
+        "Assistant context for '%s' (first 400 chars): %s",
+        question,
+        context_text[:400],
+    )
     user_content = (
         f"User question: {question}\n\n"
         "Use only the following GA4 summary context when answering. "
@@ -1584,6 +1602,7 @@ def _generate_chat_response(question: str) -> dict[str, Any]:
         )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"OpenAI chat completion failed: {exc}") from exc
+    logger.debug("Assistant OpenAI response meta: %s", completion)
 
     message = completion.choices[0].message.content if completion.choices else None
     answer_payload: dict[str, Any] = {}

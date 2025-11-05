@@ -137,6 +137,14 @@
       padding-left: 1.2rem;
       color: #10345f;
     }
+    .assistant-list {
+      margin: 12px 0;
+      padding-left: 1.4rem;
+      color: #0f315b;
+    }
+    .assistant-list li + li {
+      margin-top: 6px;
+    }
     form.chat-input {
       display: flex;
       align-items: center;
@@ -304,12 +312,78 @@
       return bubble;
     }
 
-    function buildAssistantNodes(answer) {
-      return answer.split(/\n{2,}/).map((paragraph) => {
-        const p = document.createElement('p');
-        p.textContent = paragraph.trim();
-        return p;
+    function escapeHtml(value) {
+      return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderInlineMarkdown(text) {
+      const escaped = escapeHtml(text);
+      return escaped
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>');
+    }
+
+    function renderAssistantBlocks(markdown) {
+      if (!markdown) return [];
+      const normalized = markdown
+        .replace(/\r\n/g, '\n')
+        .replace(/(?<=\S)\s+(?=\d+\.\s)/g, '\n')
+        .trim();
+      if (!normalized) return [];
+      const blocks = normalized.split(/\n{2,}/);
+      const nodes = [];
+      blocks.forEach((block) => {
+        const trimmed = block.trim();
+        if (!trimmed) return;
+        const lines = trimmed.split('\n');
+        const unorderedCandidate = lines.every(line => line.trim().startsWith('- '));
+        const orderedSegments = trimmed.split(/(?=\d+\.\s)/g).map(segment => segment.trim()).filter(Boolean);
+        const orderedCandidate =
+          orderedSegments.length > 1 &&
+          orderedSegments.every(segment => /^\d+\.\s+/.test(segment));
+
+        if (orderedCandidate) {
+          const ol = document.createElement('ol');
+          ol.className = 'assistant-list';
+          orderedSegments.forEach((segment) => {
+            const cleanText = segment.replace(/^\d+\.\s+/, '');
+            if (!cleanText) return;
+            const li = document.createElement('li');
+            li.innerHTML = renderInlineMarkdown(cleanText);
+            ol.appendChild(li);
+          });
+          if (ol.children.length) {
+            nodes.push(ol);
+          }
+          return;
+        }
+
+        if (unorderedCandidate) {
+          const ul = document.createElement('ul');
+          ul.className = 'assistant-list';
+          lines.forEach((line) => {
+            const cleanLine = line.trim().replace(/^-+\s*/, '');
+            if (!cleanLine) return;
+            const li = document.createElement('li');
+            li.innerHTML = renderInlineMarkdown(cleanLine);
+            ul.appendChild(li);
+          });
+          if (ul.children.length) {
+            nodes.push(ul);
+          }
+          return;
+        }
+        const paragraph = document.createElement('p');
+        paragraph.innerHTML = renderInlineMarkdown(trimmed);
+        nodes.push(paragraph);
       });
+      return nodes;
     }
 
     async function askAssistant(question) {
@@ -333,7 +407,7 @@
           throw new Error(payload.error || 'Assistant failed to respond.');
         }
         pendingBubble.remove();
-        appendMessage('assistant', buildAssistantNodes(payload.answer), {
+        appendMessage('assistant', renderAssistantBlocks(payload.answer), {
           highlights: payload.highlights,
           sources: payload.sources,
         });
