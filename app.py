@@ -17,7 +17,6 @@ from queue import SimpleQueue
 from threading import Thread
 from typing import Any, Callable, Sequence
 
-from openai import OpenAI
 from pinecone import Pinecone
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
@@ -44,6 +43,7 @@ from bqtools.services.persistence import (
     SummaryJob,
     SummaryReport,
 )
+from bqtools.assistant import AssistantService, OpenAIChatProvider, OpenAISettings
 
 load_environment()
 
@@ -155,21 +155,25 @@ CHAT_SUGGESTIONS: list[str] = [
 
 CHAT_SYSTEM_PROMPT = (
     "You are Tracey, a senior ecommerce analyst supporting the Euronics team. "
-    "Use the supplied GA4 summary context to answer questions with clear, data-backed insights. "
-    "Reference date ranges, call out significant changes, and propose next steps when appropriate. "
-    "If the context is insufficient, explain what is missing rather than guessing. "
-    "Respond as JSON with keys 'answer', 'highlights', and 'followups'. "
-    "'answer' should be plain text (multiple paragraphs allowed). "
-    "'highlights' must be an array of short bullet strings (can be empty). "
-    "'followups' must be an array with up to three short questions the user could ask next."
+    "Use the supplied GA4 summary context to craft data-backed insights, cite the relevant timeframes, "
+    "and provide practical next steps. "
+    "If the context lacks the details needed, clearly explain what is missing rather than guessing.\n\n"
+    "Return a JSON object with the following keys:\n"
+    "- summary (string): concise narrative answering the question.\n"
+    "- highlights (array of strings): up to five bullet-worthy call-outs.\n"
+    "- followups (array of strings): up to three short follow-up questions the user might ask next.\n"
+    "- sections (array of objects): each section must include a 'type' field and support one of these schemas:\n"
+    "  • type='paragraph' with 'text' (string)\n"
+    "  • type='bullets' with 'title' (optional) and 'items' (array of strings)\n"
+    "  • type='table' with 'title' (optional), 'headers' (array of strings), and 'rows' (array of string arrays, max 6 rows)\n"
+    "Use measured, professional tone and avoid repetition. "
+    "Prefer tables when presenting ranked lists, comparisons, or KPI breakdowns."
 )
 
-_OPENAI_CLIENT: OpenAI | None = None
 _PINECONE_CLIENT: Pinecone | None = None
 _PINECONE_INDEX_CACHE: dict[str, Any] = {}
+_ASSISTANT_SERVICE: AssistantService | None = None
 
-CHAT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-EMBED_MODEL = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "ga4")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME")
 PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT")
@@ -1342,17 +1346,6 @@ def build_summary_for_range(
         _exit_csv_mode()
 
 
-def _get_openai_client_for_chat() -> OpenAI:
-    """Return a shared OpenAI client for the assistant."""
-    global _OPENAI_CLIENT
-    if _OPENAI_CLIENT is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured; AI assistant is unavailable.")
-        _OPENAI_CLIENT = OpenAI(api_key=api_key)
-    return _OPENAI_CLIENT
-
-
 def _get_pinecone_index_for_chat():
     """Return a cached Pinecone index instance for similarity search."""
     if not PINECONE_INDEX_NAME:
@@ -1378,14 +1371,36 @@ def _get_pinecone_index_for_chat():
     return index
 
 
-def _embed_question(text: str) -> list[float]:
-    client = _get_openai_client_for_chat()
-    response = client.embeddings.create(model=EMBED_MODEL, input=text)
-    return response.data[0].embedding
+def _get_assistant_service() -> AssistantService:
+    global _ASSISTANT_SERVICE
+    if _ASSISTANT_SERVICE is not None:
+        return _ASSISTANT_SERVICE
+
+    provider_name = os.environ.get("AI_PROVIDER", "openai").strip().lower() or "openai"
+    if provider_name == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured; AI assistant is unavailable.")
+        settings = OpenAISettings(
+            api_key=api_key,
+            chat_model=os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+            embed_model=os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        )
+        provider = OpenAIChatProvider(settings)
+    else:
+        raise RuntimeError(f"Unsupported AI provider '{provider_name}'.")
+
+    _ASSISTANT_SERVICE = AssistantService(
+        provider=provider,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        default_followups=CHAT_SUGGESTIONS,
+    )
+    return _ASSISTANT_SERVICE
 
 
 def _query_similar_jobs(question: str) -> list[dict[str, Any]]:
-    vector = _embed_question(question)
+    service = _get_assistant_service()
+    vector = service.embed_question(question)
     index = _get_pinecone_index_for_chat()
     try:
         query_response = index.query(  # type: ignore[attr-defined]
@@ -1575,64 +1590,22 @@ def _generate_chat_response(question: str) -> dict[str, Any]:
             "highlights": [],
             "followups": CHAT_SUGGESTIONS[:3],
             "sources": [],
+            "sections": [],
         }
 
-    context_text = "\n\n---\n\n".join(contexts)
+    service = _get_assistant_service()
     logger.debug(
         "Assistant context for '%s' (first 400 chars): %s",
         question,
-        context_text[:400],
+        contexts[0][:400] if contexts else "",
     )
-    user_content = (
-        f"User question: {question}\n\n"
-        "Use only the following GA4 summary context when answering. "
-        "If the context does not contain the required details, say so.\n\n"
-        f"{context_text}"
+    response = service.generate(
+        question=question,
+        contexts=contexts,
+        suggestions=CHAT_SUGGESTIONS,
+        sources=sources,
     )
-
-    client = _get_openai_client_for_chat()
-    try:
-        completion = client.chat.completions.create(
-            model=CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"OpenAI chat completion failed: {exc}") from exc
-    logger.debug("Assistant OpenAI response meta: %s", completion)
-
-    message = completion.choices[0].message.content if completion.choices else None
-    answer_payload: dict[str, Any] = {}
-    if message:
-        try:
-            answer_payload = json.loads(message)
-        except json.JSONDecodeError:
-            answer_payload = {"answer": message}
-
-    answer_text = str(answer_payload.get("answer") or "").strip()
-    highlights = answer_payload.get("highlights")
-    followups = answer_payload.get("followups")
-
-    if not isinstance(highlights, list):
-        highlights = []
-    if not isinstance(followups, list) or not followups:
-        followups = CHAT_SUGGESTIONS[:3]
-
-    if not answer_text:
-        answer_text = (
-            "I was unable to produce a detailed answer from the current summaries. "
-            "Please refine the question or refresh the underlying data."
-        )
-
-    return {
-        "answer": answer_text,
-        "highlights": [str(item) for item in highlights if isinstance(item, str)],
-        "followups": [str(item) for item in followups if isinstance(item, str)][:3],
-        "sources": sources,
-    }
+    return response.as_dict()
 
 
 @app.get("/assistant")

@@ -103,8 +103,8 @@
       gap: 16px;
       padding: 24px;
       border-radius: 32px;
-      background: var(--card-bg);
-      box-shadow: var(--shadow-sm);
+      /* background: var(--card-bg);
+      box-shadow: var(--shadow-sm); */
       min-height: 200px;
     }
     .message {
@@ -144,6 +144,39 @@
     }
     .assistant-list li + li {
       margin-top: 6px;
+    }
+    .assistant-table {
+      margin: 16px 0;
+      padding: 18px;
+      background: #ffffff;
+      border-radius: 18px;
+      box-shadow: 0 8px 20px rgba(13, 57, 104, 0.08);
+      border: 1px solid rgba(12, 93, 187, 0.12);
+    }
+    .assistant-table h3 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+      color: var(--brand-blue-dark);
+      font-weight: 600;
+    }
+    .assistant-table table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+    }
+    .assistant-table th,
+    .assistant-table td {
+      border-bottom: 1px solid rgba(12, 93, 187, 0.12);
+      padding: 10px 12px;
+      text-align: left;
+    }
+    .assistant-table th {
+      font-weight: 600;
+      color: var(--brand-blue-dark);
+      background: rgba(12, 93, 187, 0.08);
+    }
+    .assistant-table tr:last-child td {
+      border-bottom: none;
     }
     form.chat-input {
       display: flex;
@@ -386,6 +419,87 @@
       return nodes;
     }
 
+    function renderAssistantSections(payload) {
+      const nodes = [];
+      const sections = Array.isArray(payload.sections) ? payload.sections : [];
+      sections.forEach((section) => {
+        if (!section || typeof section !== 'object' || !section.type) return;
+        const type = String(section.type).toLowerCase();
+        if (type === 'paragraph' && section.text) {
+          const p = document.createElement('p');
+          p.innerHTML = renderInlineMarkdown(section.text);
+          nodes.push(p);
+          return;
+        }
+        if (type === 'bullets' && Array.isArray(section.items) && section.items.length) {
+          if (section.title) {
+            const heading = document.createElement('p');
+            heading.innerHTML = `<strong>${renderInlineMarkdown(section.title)}</strong>`;
+            nodes.push(heading);
+          }
+          const ul = document.createElement('ul');
+          ul.className = 'assistant-list';
+          section.items.forEach((item) => {
+            if (!item) return;
+            const li = document.createElement('li');
+            li.innerHTML = renderInlineMarkdown(item);
+            ul.appendChild(li);
+          });
+          if (ul.children.length) {
+            nodes.push(ul);
+          }
+          return;
+        }
+        if (type === 'table' && Array.isArray(section.rows) && section.rows.length) {
+          const wrapper = document.createElement('div');
+          wrapper.className = 'assistant-table';
+          if (section.title) {
+            const title = document.createElement('h3');
+            title.textContent = section.title;
+            wrapper.appendChild(title);
+          }
+          const table = document.createElement('table');
+          if (Array.isArray(section.headers) && section.headers.length) {
+            const thead = document.createElement('thead');
+            const tr = document.createElement('tr');
+            section.headers.forEach((header) => {
+              const th = document.createElement('th');
+              th.innerHTML = renderInlineMarkdown(header);
+              tr.appendChild(th);
+            });
+            thead.appendChild(tr);
+            table.appendChild(thead);
+          }
+          const tbody = document.createElement('tbody');
+          section.rows.forEach((row) => {
+            const tr = document.createElement('tr');
+            row.forEach((cell) => {
+              const td = document.createElement('td');
+              td.innerHTML = renderInlineMarkdown(String(cell));
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          wrapper.appendChild(table);
+          nodes.push(wrapper);
+          return;
+        }
+      });
+      return nodes;
+    }
+
+    function buildAssistantContent(payload) {
+      if (payload && Array.isArray(payload.sections) && payload.sections.length) {
+        const sectionNodes = renderAssistantSections(payload);
+        if (sectionNodes.length) {
+          return sectionNodes;
+        }
+      }
+      const text = payload && (payload.answer || payload.summary || '');
+      return renderAssistantBlocks(text);
+    }
+
     async function askAssistant(question) {
       state.isSubmitting = true;
       chatSubmit.disabled = true;
@@ -407,7 +521,7 @@
           throw new Error(payload.error || 'Assistant failed to respond.');
         }
         pendingBubble.remove();
-        appendMessage('assistant', renderAssistantBlocks(payload.answer), {
+        appendMessage('assistant', buildAssistantContent(payload), {
           highlights: payload.highlights,
           sources: payload.sources,
         });
