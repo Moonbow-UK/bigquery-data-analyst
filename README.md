@@ -60,6 +60,24 @@ Notes:
 - For production usage prefer service-account credentials with the `google-cloud-bigquery` client.
 - The shared library layer makes it straightforward to add new surfaces (database writers, chat assistants, dashboards) without duplicating BigQuery plumbing.
 
+### Bulk intraday exports
+
+When you need a rolling 15-day window of GA4 intraday data, use the helper script:
+
+```bash
+chmod +x scripts/export_intraday_csvs.sh      # first run only
+./scripts/export_intraday_csvs.sh             # defaults to today (UTC)
+./scripts/export_intraday_csvs.sh 2025-10-31  # anchor the range explicitly
+```
+
+The script:
+- loads `.env` so `BIGQUERY_PROJECT_ID`, `BIGQUERY_DATASET_ID`, and credentials are available
+- writes one CSV per day into `var/exports/csv`
+- accepts an optional `YYYY-MM-DD` anchor date, then walks backwards 15 days
+- tries `${BIGQUERY_INTRADAY_PREFIX}` first and falls back to `events_YYYYMMDD` tables when needed
+
+Run it from the project root; otherwise the relative `var/exports/csv` path resolves under your current directory.
+
 ## Persistence adapters
 
 You can persist `BigQueryService` results with the adapters under `bqtools.persistence`.
@@ -146,6 +164,16 @@ BIGQUERY_USE_CSV_FILE=/absolute/path/to/export.csv
 
 When enabled, `summarize_dataset.py` produces a GA4-style intraday digest: executive metrics (events, users, sessions, engagement), top events/pages, device and geo mixes, plus analyst highlights and next-step recommendations. The `--max-*` flags still control how many columns and top values are displayed, and the narrative mirrors the companion PDF.
 
+For unattended backfills across multiple days, use the range-aware helper:
+
+```bash
+python scripts/summarize_local_csvs.py --start-date 2025-10-24 --days 7
+```
+
+The script reuses the Flask app defaults, skips dates with missing exports (logging the skip), and persists summaries through the configured database. Add `--refresh-json` to regenerate the cached NDJSON files from existing CSVs without hitting BigQuery, or `--force-refresh` to rebuild the CSV/JSON exports end-to-end (may require BigQuery quota). Use `--all` to walk every dated CSV under `var/exports/csv` regardless of date, or `--end-date` when you prefer an explicit range instead of `--days`.
+
+Checksums are recorded in `var/exports/checksums.json` so the CLI can detect when an existing JSON export no longer matches its source CSV; mismatches are automatically refreshed. Opt out with `--skip-integrity-check` if you only want to touch files when explicitly requested. Combine any of the above with `--dry-run` to preview which dates would be processed and which JSON files would be regenerated without modifying the filesystem.
+
 ### Credential path configuration
 
 Both CLI tools (`bigquery.py`, `summarize_dataset.py`) and the web UI read the OAuth/service account JSON from:
@@ -179,6 +207,59 @@ Open [http://127.0.0.1:5000/](http://127.0.0.1:5000/) and enter:
 The page displays dataset metadata, a table overview, and per-table drill-down sections rendered as HTML tables for easy sharing with non-technical stakeholders.
 
 Daily run logs land under `var/logs/` with filenames prefixed by the UTC date (for example `2025-11-04-app.log`). Cached summary reuse and BigQuery refreshes are annotated there, making it easy to confirm when the app serves previously generated reports.
+
+CSV and JSON exports now live under `var/exports/` (`var/exports/csv` and `var/exports/json`). Legacy files in the project root are moved automatically the first time they are referenced.
+
+### AI Advisor bootstrap (Pinecone + OpenAI)
+
+Add the following environment variables (via `.env` or your shell) before running the manual ingestion command or enabling the chat assistant:
+
+```
+OPENAI_API_KEY=sk-...
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_EMBED_MODEL=text-embedding-3-small
+PINECONE_API_KEY=pc-...
+PINECONE_ENVIRONMENT=gcp-starter
+PINECONE_INDEX_NAME=ga4-summaries
+PINECONE_NAMESPACE=ga4
+```
+
+The free Pinecone “Starter” tier supports a single index in the `gcp-starter` environment running one `s1.x1` pod (max dimension 1536, which matches `text-embedding-3-small`). Upgrades are seamless—create a larger pod-based or serverless index with the same name/namespace and re-run the ingestion script to repopulate vectors.
+
+Once GA4 summaries exist in the PostgreSQL cache, trigger manual embedding syncs:
+
+```bash
+python3 scripts/ingest_pinecone.py --range today
+python3 scripts/ingest_pinecone.py --range last7days --limit 5
+python3 scripts/ingest_pinecone.py --range all --dry-run  # preview without upsert
+```
+
+The script loads completed summary jobs, embeds the full summary JSON payload, and upserts the vectors (with metadata) into the configured Pinecone namespace.
+
+### Resetting or pruning cached summaries
+
+Use the management helper under `scripts/manage_summaries.py` to clean out the persistence tables:
+
+```bash
+# Drop duplicate jobs and keep only the most recent per dataset/range
+python3 scripts/manage_summaries.py
+
+# Preview actions without mutating the database
+python3 scripts/manage_summaries.py --dry-run
+
+# Wipe all summary jobs/exports/reports for a fresh start
+python3 scripts/manage_summaries.py --reset
+```
+
+Each new summary run now deletes any prior rows for the same dataset + range before storing fresh results, so the tables stay at a single entry per date going forward.
+
+To backfill daily summaries over a window of dates without using `curl`, run:
+
+```bash
+python3 scripts/run_daily_summaries.py --start-date 2025-10-30 --days 7
+```
+
+The helper walks backwards from the start date (inclusive), triggers `/api/progress-summary` for each day, and skips dates that already have a completed entry unless you add `--force-refresh`. Pass `--auto-refresh-stale` to automatically refresh intraday exports whose CSV is older than two days (otherwise it will prompt), use `--verbose` to stream progress messages, and `--base-url` (defaults to `http://127.0.0.1:5500`) to target a remote deployment.
 
 ### HTTP API
 

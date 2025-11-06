@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import os
+import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -14,7 +15,9 @@ from logging.handlers import BaseRotatingHandler
 from pathlib import Path
 from queue import SimpleQueue
 from threading import Thread
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
+
+from pinecone import Pinecone
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from google.api_core import exceptions as gcloud_exceptions
@@ -40,12 +43,21 @@ from bqtools.services.persistence import (
     SummaryJob,
     SummaryReport,
 )
+from bqtools.assistant import AssistantService, OpenAIChatProvider, OpenAISettings
 
 load_environment()
+
+def _env_flag_from_str(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+DEBUG_MODE = _env_flag_from_str(os.environ.get("DEBUG_MODE"), False)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "change-me")
 app.config["DEFAULT_CREDENTIALS_FILE"] = str(default_credentials_file())
+app.config["DEBUG"] = DEBUG_MODE
 
 
 summary_api = create_summary_blueprint(
@@ -106,10 +118,17 @@ class DailyPrefixedFileHandler(BaseRotatingHandler):
 
 
 LOG_DIR = Path("var/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+EXPORT_ROOT = Path("var/exports")
+CSV_EXPORT_DIR = EXPORT_ROOT / "csv"
+JSON_EXPORT_DIR = EXPORT_ROOT / "json"
+for export_dir in (CSV_EXPORT_DIR, JSON_EXPORT_DIR):
+    export_dir.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     file_handler = DailyPrefixedFileHandler(LOG_DIR, "app.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -122,7 +141,103 @@ if not logger.handlers:
 logger.addHandler(stream_handler)
 logger.propagate = False
 
+if DEBUG_MODE:
+    logger.debug("Debug mode enabled for summary_app.")
+
 persistence_service = PersistenceService(logger=logger.getChild("persistence"))
+
+CHAT_SUGGESTIONS: list[str] = [
+    "Show me which product categories have the highest cart abandonment rate this week.",
+    "Identify pages with the lowest conversion rates and suggest possible reasons.",
+    "Where are we losing the most potential revenue across the customer journey?",
+    "Summarise noteworthy GA4 trends from the past seven days.",
+]
+
+CHAT_SYSTEM_PROMPT = (
+    "You are Tracey, a senior ecommerce analyst supporting the Euronics team. "
+    "Use the supplied GA4 summary context to craft data-backed insights, cite the relevant timeframes, "
+    "and provide practical next steps. "
+    "If the context lacks the details needed, clearly explain what is missing rather than guessing.\n\n"
+    "Return a JSON object with the following keys:\n"
+    "- summary (string): concise narrative answering the question.\n"
+    "- highlights (array of strings): up to five bullet-worthy call-outs.\n"
+    "- followups (array of strings): up to three short follow-up questions the user might ask next.\n"
+    "- sections (array of objects): each section must include a 'type' field and support one of these schemas:\n"
+    "  • type='paragraph' with 'text' (string)\n"
+    "  • type='bullets' with 'title' (optional) and 'items' (array of strings)\n"
+    "  • type='table' with 'title' (optional), 'headers' (array of strings), and 'rows' (array of string arrays, max 6 rows)\n"
+    "Use measured, professional tone and avoid repetition. "
+    "Prefer tables when presenting ranked lists, comparisons, or KPI breakdowns."
+)
+
+_PINECONE_CLIENT: Pinecone | None = None
+_PINECONE_INDEX_CACHE: dict[str, Any] = {}
+_ASSISTANT_SERVICE: AssistantService | None = None
+
+PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "ga4")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME")
+PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT")
+CHAT_TOP_K = max(1, int(os.environ.get("AI_ASSISTANT_TOP_K", "4")))
+
+
+def _csv_export_path(project_id: str, dataset_id: str, table_name: str) -> Path:
+    filename = f"{project_id}_{dataset_id}_{table_name}.csv"
+    legacy = Path(filename)
+    target = CSV_EXPORT_DIR / filename
+    if legacy.exists() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            logger.info("Migrated legacy CSV %s to %s", legacy, target)
+        except OSError as exc:
+            logger.warning("Unable to move legacy CSV %s to %s: %s", legacy, target, exc)
+    return target
+
+
+def _json_export_path(project_id: str, dataset_id: str, table_name: str) -> Path:
+    filename = f"{project_id}_{dataset_id}_{table_name}.json"
+    legacy = Path(filename)
+    target = JSON_EXPORT_DIR / filename
+    if legacy.exists() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            logger.info("Migrated legacy JSON %s to %s", legacy, target)
+        except OSError as exc:
+            logger.warning("Unable to move legacy JSON %s to %s: %s", legacy, target, exc)
+    return target
+
+
+def _purge_existing_summary_jobs(
+    session: Session,
+    dataset_record: Dataset,
+    range_key: str,
+    *,
+    statuses: tuple[str, ...] | None = None,
+    exclude_job_id: uuid.UUID | None = None,
+) -> int:
+    stmt = select(SummaryJob).where(
+        SummaryJob.dataset_id == dataset_record.id,
+        SummaryJob.range_key == range_key,
+    )
+    if statuses is not None:
+        stmt = stmt.where(SummaryJob.status.in_(statuses))
+    if exclude_job_id is not None:
+        stmt = stmt.where(SummaryJob.id != exclude_job_id)
+    jobs = session.execute(stmt).scalars().all()
+    if not jobs:
+        return 0
+    for job in jobs:
+        session.delete(job)
+    session.commit()
+    logger.info(
+        "Removed %d existing summary job(s) for %s.%s range=%s",
+        len(jobs),
+        dataset_record.project_id,
+        dataset_record.dataset_id,
+        range_key,
+    )
+    return len(jobs)
 
 
 def _coerce_positive_int(value: Any, default: int = 1) -> int:
@@ -440,8 +555,8 @@ def _resolve_exports(
         target_date = now
         date_str = target_date.strftime("%Y%m%d")
         table_name = f"{intraday_prefix}{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         exports = [
             {
                 "table_name": table_name,
@@ -456,11 +571,11 @@ def _resolve_exports(
         target_date = now - timedelta(days=1)
         date_str = target_date.strftime("%Y%m%d")
         table_name = f"events_{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         fallback_table_name = f"{intraday_prefix}{date_str}"
-        fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-        fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+        fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+        fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
         exports = [
             {
                 "table_name": table_name,
@@ -482,11 +597,11 @@ def _resolve_exports(
             target_date = now - timedelta(days=offset)
             date_str = target_date.strftime("%Y%m%d")
             table_name = f"events_{date_str}"
-            csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-            json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+            csv_path = _csv_export_path(project_id, dataset_id, table_name)
+            json_path = _json_export_path(project_id, dataset_id, table_name)
             fallback_table_name = f"{intraday_prefix}{date_str}"
-            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+            fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
             exports.append(
                 {
                     "table_name": table_name,
@@ -500,7 +615,11 @@ def _resolve_exports(
                     "fallback_json_path": fallback_json_path,
                 }
             )
-        summary_csv = Path(f"{project_id}_{dataset_id}_events_last{days_to_fetch}days.csv")
+        summary_csv = _csv_export_path(
+            project_id,
+            dataset_id,
+            f"events_last{days_to_fetch}days",
+        )
         day_label = "day" if days_to_fetch == 1 else "days"
         return exports, f"Last {days_to_fetch} {day_label}", summary_csv
     if normalized_key.startswith("date:"):
@@ -514,16 +633,16 @@ def _resolve_exports(
         date_str = target_date.strftime("%Y%m%d")
         is_today = target_date.date() == now.date()
         table_name = f"{intraday_prefix}{date_str}" if is_today else f"events_{date_str}"
-        csv_path = Path(f"{project_id}_{dataset_id}_{table_name}.csv")
-        json_path = Path(f"{project_id}_{dataset_id}_{table_name}.json")
+        csv_path = _csv_export_path(project_id, dataset_id, table_name)
+        json_path = _json_export_path(project_id, dataset_id, table_name)
         fallback_table_name: str | None = None
         fallback_csv_path: Path | None = None
         fallback_json_path: Path | None = None
         fallback_full_table_id: str | None = None
         if not is_today:
             fallback_table_name = f"{intraday_prefix}{date_str}"
-            fallback_csv_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.csv")
-            fallback_json_path = Path(f"{project_id}_{dataset_id}_{fallback_table_name}.json")
+            fallback_csv_path = _csv_export_path(project_id, dataset_id, fallback_table_name)
+            fallback_json_path = _json_export_path(project_id, dataset_id, fallback_table_name)
             fallback_full_table_id = f"{project_id}.{dataset_id}.{fallback_table_name}"
         exports = [
             {
@@ -774,6 +893,7 @@ def build_summary_for_range(
     project_override = str(form_defaults["project"]) if form_defaults["project"] else None
     credentials_path = str(form_defaults["credentials_file"]) if form_defaults["credentials_file"] else None
     week_days = int(form_defaults["week_days"])
+    job_week_days = week_days if normalized_range == "last7days" else 1
 
     external_progress_callback = progress_callback
     job_record: SummaryJob | None = None
@@ -827,10 +947,22 @@ def build_summary_for_range(
                 )
             db_session.commit()
 
+            removed_jobs = _purge_existing_summary_jobs(
+                db_session,
+                dataset_record,
+                normalized_range,
+                statuses=("completed", "failed"),
+            )
+            if removed_jobs:
+                logger.debug(
+                    "Purged %d prior job(s) before creating new summary job.",
+                    removed_jobs,
+                )
+
             job_record = SummaryJob(
                 dataset_id=dataset_record.id,
                 range_key=normalized_range,
-                week_days=week_days,
+                week_days=job_week_days,
                 status="running",
                 started_at=now,
                 progress=0.0,
@@ -1165,6 +1297,19 @@ def build_summary_for_range(
             db_session.add(report_record)
             db_session.add(job_record)
             db_session.commit()
+            removed_after = _purge_existing_summary_jobs(
+                db_session,
+                dataset_record,
+                normalized_range,
+                statuses=("completed", "failed"),
+                exclude_job_id=job_record.id,
+            )
+            if removed_after:
+                logger.debug(
+                    "Removed %d older completed job(s) after finishing job %s",
+                    removed_after,
+                    job_record.id,
+                )
             logger.info(
                 "Summary job %s completed successfully (events=%s)",
                 job_record.id,
@@ -1199,6 +1344,295 @@ def build_summary_for_range(
         raise
     finally:
         _exit_csv_mode()
+
+
+def _get_pinecone_index_for_chat():
+    """Return a cached Pinecone index instance for similarity search."""
+    if not PINECONE_INDEX_NAME:
+        raise RuntimeError("PINECONE_INDEX_NAME is not configured; AI assistant is unavailable.")
+    if not PINECONE_ENVIRONMENT:
+        raise RuntimeError("PINECONE_ENVIRONMENT is not configured; AI assistant is unavailable.")
+
+    global _PINECONE_CLIENT
+    if _PINECONE_CLIENT is None:
+        api_key = os.environ.get("PINECONE_API_KEY")
+        if not api_key:
+            raise RuntimeError("PINECONE_API_KEY is not configured; AI assistant is unavailable.")
+        _PINECONE_CLIENT = Pinecone(api_key=api_key, environment=PINECONE_ENVIRONMENT)
+
+    cached = _PINECONE_INDEX_CACHE.get(PINECONE_INDEX_NAME)
+    if cached is not None:
+        return cached
+    try:
+        index = _PINECONE_CLIENT.Index(PINECONE_INDEX_NAME)  # type: ignore[union-attr]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Unable to access Pinecone index '{PINECONE_INDEX_NAME}': {exc}") from exc
+    _PINECONE_INDEX_CACHE[PINECONE_INDEX_NAME] = index
+    return index
+
+
+def _get_assistant_service() -> AssistantService:
+    global _ASSISTANT_SERVICE
+    if _ASSISTANT_SERVICE is not None:
+        return _ASSISTANT_SERVICE
+
+    provider_name = os.environ.get("AI_PROVIDER", "openai").strip().lower() or "openai"
+    if provider_name == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured; AI assistant is unavailable.")
+        settings = OpenAISettings(
+            api_key=api_key,
+            chat_model=os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+            embed_model=os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        )
+        provider = OpenAIChatProvider(settings)
+    else:
+        raise RuntimeError(f"Unsupported AI provider '{provider_name}'.")
+
+    _ASSISTANT_SERVICE = AssistantService(
+        provider=provider,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        default_followups=CHAT_SUGGESTIONS,
+    )
+    return _ASSISTANT_SERVICE
+
+
+def _query_similar_jobs(question: str) -> list[dict[str, Any]]:
+    service = _get_assistant_service()
+    vector = service.embed_question(question)
+    index = _get_pinecone_index_for_chat()
+    try:
+        query_response = index.query(  # type: ignore[attr-defined]
+            namespace=PINECONE_NAMESPACE,
+            vector=vector,
+            top_k=CHAT_TOP_K,
+            include_metadata=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Pinecone query failed: {exc}") from exc
+
+    matches = getattr(query_response, "matches", None) or query_response.get("matches", [])
+    results: list[dict[str, Any]] = []
+    for match in matches:
+        metadata = getattr(match, "metadata", None) or match.get("metadata") or {}
+        candidate_id = metadata.get("job_id") or getattr(match, "id", None) or match.get("id")
+        if not candidate_id:
+            continue
+        try:
+            job_uuid = uuid.UUID(str(candidate_id))
+        except ValueError:
+            continue
+        score = getattr(match, "score", None) or metadata.get("score")
+        results.append(
+            {
+                "job_id": job_uuid,
+                "score": float(score) if score is not None else 0.0,
+                "metadata": metadata,
+            }
+        )
+    logger.debug("Assistant Pinecone matches for '%s': %s", question, results)
+    return results
+
+
+def _load_summary_jobs(session: Session, job_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, SummaryJob]:
+    if not job_ids:
+        return {}
+    stmt = (
+        select(SummaryJob)
+        .options(joinedload(SummaryJob.report), joinedload(SummaryJob.dataset))
+        .where(SummaryJob.id.in_(tuple(job_ids)))
+    )
+    records = session.execute(stmt).scalars().unique().all()
+    return {record.id: record for record in records if record.report is not None}
+
+
+def _format_ga4_metrics(payload: dict[str, Any]) -> str:
+    metric_order = [
+        ("total_events", "Total events"),
+        ("unique_users", "Unique users"),
+        ("unique_sessions", "Unique sessions"),
+        ("engaged_sessions", "Engaged sessions"),
+        ("total_revenue", "Revenue (USD)"),
+        ("conversions", "Conversions"),
+    ]
+    parts: list[str] = []
+    for key, label in metric_order:
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            formatted = f"{value:,.0f}"
+        else:
+            formatted = str(value)
+        parts.append(f"{label}: {formatted}")
+    return "; ".join(parts)
+
+
+def _build_summary_context_block(job: SummaryJob) -> str:
+    dataset_label = (
+        f"{job.dataset.project_id}.{job.dataset.dataset_id}"
+        if job.dataset
+        else "unknown dataset"
+    )
+    finished_at = job.finished_at.isoformat(timespec="seconds") if job.finished_at else "unknown"
+    summary_payload: Any = job.report.raw_summary_json
+    if isinstance(summary_payload, str):
+        try:
+            summary_payload = json.loads(summary_payload)
+        except json.JSONDecodeError:
+            summary_payload = {"raw_summary": summary_payload}
+
+    lines = [
+        f"Summary ID: {job.id}",
+        f"Dataset: {dataset_label}",
+        f"Range: {job.range_key}",
+        f"Completed at: {finished_at}",
+    ]
+    if job.filter_note:
+        lines.append(f"Notes: {job.filter_note}")
+
+    intraday_flag = bool(summary_payload.get("intraday_active") or job.intraday_active)
+    if intraday_flag:
+        last_updated = summary_payload.get("intraday_last_updated_at")
+        if last_updated:
+            lines.append(f"Intraday snapshot last updated at {last_updated}.")
+        else:
+            lines.append("Intraday snapshot: true.")
+
+    csv_report_text = summary_payload.get("csv_report_text")
+    if isinstance(csv_report_text, str) and csv_report_text.strip():
+        trimmed = csv_report_text.strip()
+        lines.append("Narrative:")
+        lines.append(trimmed)
+
+    ga4_summary = summary_payload.get("ga4_summary")
+    if isinstance(ga4_summary, dict):
+        summary_line = _format_ga4_metrics(ga4_summary)
+        if summary_line:
+            lines.append(f"Key metrics: {summary_line}")
+
+    product_stats = summary_payload.get("product_purchase_stats")
+    if isinstance(product_stats, dict):
+        most = product_stats.get("most_purchased")
+        if isinstance(most, list) and most:
+            top_items = ", ".join(
+                f"{entry.get('name')} ({entry.get('count')})"
+                for entry in most[:5]
+                if isinstance(entry, dict) and entry.get("name")
+            )
+            if top_items:
+                lines.append(f"Top purchased products: {top_items}.")
+
+    sections = summary_payload.get("csv_sections")
+    if isinstance(sections, list):
+        for section in sections[:3]:
+            if not isinstance(section, dict):
+                continue
+            title = section.get("title") or section.get("heading")
+            summary_text = section.get("summary") or section.get("narrative")
+            if title and summary_text:
+                lines.append(f"{title}: {summary_text}")
+
+    return "\n".join(lines)
+
+
+def _generate_chat_response(question: str) -> dict[str, Any]:
+    matches = _query_similar_jobs(question)
+    if not matches:
+        return {
+            "answer": (
+                "I could not find any cached GA4 summaries that relate to that question. "
+                "Try regenerating recent summaries or adjust the timeframe you're asking about."
+            ),
+            "highlights": [],
+            "followups": CHAT_SUGGESTIONS[:3],
+            "sources": [],
+        }
+
+    session = None
+    try:
+        session = persistence_service.get_session()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Database session unavailable: {exc}") from exc
+
+    try:
+        job_map = _load_summary_jobs(session, [match["job_id"] for match in matches])
+    finally:
+        session.close()
+
+    contexts: list[str] = []
+    sources: list[dict[str, Any]] = []
+    for match in matches:
+        job = job_map.get(match["job_id"])
+        if not job or not job.report:
+            continue
+        contexts.append(_build_summary_context_block(job))
+        sources.append(
+            {
+                "job_id": str(job.id),
+                "range_key": job.range_key,
+                "finished_at": job.finished_at.isoformat(timespec="seconds") if job.finished_at else None,
+                "score": match["score"],
+                "dataset": (
+                    f"{job.dataset.project_id}.{job.dataset.dataset_id}" if job.dataset else None
+                ),
+            }
+        )
+
+    if not contexts:
+        logger.debug("Assistant: no context assembled for question '%s' (matches=%s)", question, matches)
+        return {
+            "answer": (
+                "The assistant could not load the supporting summaries required to answer that question. "
+                "Please regenerate the summaries and try again."
+            ),
+            "highlights": [],
+            "followups": CHAT_SUGGESTIONS[:3],
+            "sources": [],
+            "sections": [],
+        }
+
+    service = _get_assistant_service()
+    logger.debug(
+        "Assistant context for '%s' (first 400 chars): %s",
+        question,
+        contexts[0][:400] if contexts else "",
+    )
+    response = service.generate(
+        question=question,
+        contexts=contexts,
+        suggestions=CHAT_SUGGESTIONS,
+        sources=sources,
+    )
+    return response.as_dict()
+
+
+@app.get("/assistant")
+def assistant_home() -> str:
+    user_name = os.environ.get("AI_ASSISTANT_USER_NAME", "Tracey")
+    return render_template(
+        "assistant.html",
+        user_name=user_name,
+        suggestions=CHAT_SUGGESTIONS,
+    )
+
+
+@app.post("/assistant/chat")
+def assistant_chat():
+    payload = request.get_json(silent=True) or {}
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "Please enter a question for the assistant."}), 400
+    try:
+        response_payload = _generate_chat_response(question)
+    except RuntimeError as exc:
+        logger.error("Assistant request failed: %s", exc)
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected assistant error: %s", exc)
+        return jsonify({"error": "Unexpected error while generating a response."}), 500
+    return jsonify(response_payload)
 
 
 @app.route("/", methods=["GET", "POST"])
