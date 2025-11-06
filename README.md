@@ -150,12 +150,16 @@ CLOUD_SQL_DB_NAME=analytics                                 # or POSTGRES_DB
 # Optional overrides:
 # CLOUD_SQL_USE_CONNECTOR=true        # defaults to true when the instance name is set
 # CLOUD_SQL_IP_TYPE=PRIVATE           # defaults to PUBLIC
-# CLOUD_SQL_CONNECTOR_DRIVER=psycopg2 # defaults to psycopg
+# CLOUD_SQL_CONNECTOR_DRIVER=pg8000   # auto-detects installed drivers (psycopg ➜ pg8000)
+# POSTGRES_CONNECTOR_DRIVER=pg8000    # alias for the above when using Secret Manager naming
 ```
 
 Every surface that relies on `PersistenceService` (Flask app, CLI helpers, `scripts/manage_summaries.py`)
 now shares this connector-aware SQLAlchemy engine. Unset `CLOUD_SQL_INSTANCE_CONNECTION_NAME` (or set
 `CLOUD_SQL_USE_CONNECTOR=false`) to fall back to a regular `DATABASE_URL` for local development.
+The code auto-detects installed drivers (preferring `psycopg`, then `pg8000`), so installing
+`cloud-sql-python-connector[pg8000]` on Cloud Run works out of the box; set
+`CLOUD_SQL_CONNECTOR_DRIVER`/`POSTGRES_CONNECTOR_DRIVER` if you need to pin a specific driver.
 
 ## Dataset summary helper
 

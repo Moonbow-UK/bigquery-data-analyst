@@ -323,15 +323,46 @@ class PersistenceService:
         ip_pref = (os.environ.get("CLOUD_SQL_IP_TYPE", "PUBLIC") or "PUBLIC").strip().upper()
         ip_type = IPTypes.PRIVATE if ip_pref == "PRIVATE" else IPTypes.PUBLIC
 
-        driver = (os.environ.get("CLOUD_SQL_CONNECTOR_DRIVER") or "psycopg").strip()
-        if not driver:
-            driver = "psycopg"
+        driver = self._resolve_connector_driver(
+            _first_env("CLOUD_SQL_CONNECTOR_DRIVER", "POSTGRES_CONNECTOR_DRIVER")
+        )
 
         return {
             **config,
             "ip_type": ip_type,
             "driver": driver,
         }
+
+    def _resolve_connector_driver(self, explicit: str | None) -> str:
+        candidates: list[str] = []
+        if explicit:
+            candidates.append(explicit)
+        candidates.extend(["psycopg", "pg8000", "psycopg2"])
+        for candidate in candidates:
+            name = (candidate or "").strip()
+            if not name:
+                continue
+            if self._driver_available(name):
+                return name
+        raise RuntimeError(
+            "No supported Cloud SQL connector driver is installed. Install 'psycopg' or 'cloud-sql-python-connector[pg8000]' and set CLOUD_SQL_CONNECTOR_DRIVER accordingly."
+        )
+
+    @staticmethod
+    def _driver_available(name: str) -> bool:
+        module_map = {
+            "psycopg": "psycopg",
+            "pg8000": "pg8000",
+            "psycopg2": "psycopg2",
+        }
+        module_name = module_map.get(name.lower())
+        if module_name is None:
+            return True
+        try:  # pragma: no cover - availability check
+            __import__(module_name)
+            return True
+        except ImportError:
+            return False
 
     def _create_connector_engine(self, *, echo: bool) -> Engine:
         settings = self._cloud_sql_config()
