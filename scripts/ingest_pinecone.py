@@ -37,6 +37,11 @@ def _parse_args() -> argparse.Namespace:
         description="Embed GA4 summary JSON and upsert into Pinecone."
     )
     parser.add_argument(
+        "--env-file",
+        dest="env_file",
+        help="Optional .env file to load before running (e.g., .env.prod for remote assets).",
+    )
+    parser.add_argument(
         "--range",
         dest="range_key",
         default="today",
@@ -160,7 +165,7 @@ def _batched(iterable: Iterable, size: int) -> Iterable[list]:
 
 def main() -> None:
     args = _parse_args()
-    load_environment()
+    load_environment(args.env_file)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s"
     )
