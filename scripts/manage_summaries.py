@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bqtools.config import load_environment
+from bqtools.services.persistence import PersistenceService
 
 LOGGER = logging.getLogger("manage_summaries")
 
@@ -37,12 +37,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_database_url() -> str:
+def _configure_engine():
     load_environment()
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is not defined.")
-    return database_url
+    persistence = PersistenceService(logger=LOGGER.getChild("persistence"))
+    if not persistence.is_database_mode():
+        raise RuntimeError("Persistence service is configured for CSV mode; database access is required.")
+    return persistence.configure_engine()
 
 
 def _prune_duplicates(engine, dry_run: bool) -> None:
@@ -94,8 +94,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
-    database_url = _load_database_url()
-    engine = create_engine(database_url, future=True)
+    engine = _configure_engine()
 
     if args.reset:
         _reset_tables(engine, args.dry_run)

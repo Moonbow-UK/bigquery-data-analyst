@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
-from typing import Iterator, Literal
+from typing import Any, Iterator, Literal
 
 from sqlalchemy import (
     BigInteger,
@@ -160,6 +161,13 @@ class SummaryReport(Base):
     job: Mapped["SummaryJob"] = relationship("SummaryJob", back_populates="report")
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class PersistenceService:
     """Controls whether we persist to PostgreSQL or fall back to CSV mode."""
 
@@ -167,6 +175,8 @@ class PersistenceService:
         self._logger = logger or logging.getLogger("summary_app.persistence")
         self._engine: Engine | None = None
         self._session_factory: sessionmaker[Session] | None = None
+        self._cloud_sql_connector: Any | None = None
+        self._cloud_sql_connector_registered = False
 
     @property
     def mode(self) -> PersistenceMode:
@@ -196,8 +206,11 @@ class PersistenceService:
         if not self.is_database_mode():
             raise RuntimeError("Engine configuration requested while CSV persistence is active.")
         if self._engine is None:
-            database_url = self._database_url()
-            self._engine = create_engine(database_url, echo=echo, future=True)
+            if self._should_use_cloud_sql_connector():
+                self._engine = self._create_connector_engine(echo=echo)
+            else:
+                database_url = self._database_url()
+                self._engine = create_engine(database_url, echo=echo, future=True)
             self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
             Base.metadata.create_all(bind=self._engine)
             self._ensure_schema_updates(self._engine)
@@ -257,6 +270,86 @@ class PersistenceService:
                     connection.execute(
                         text("ALTER TABLE summary_exports ADD COLUMN intraday_fallback BOOLEAN NOT NULL DEFAULT FALSE")
                     )
+
+    def _should_use_cloud_sql_connector(self) -> bool:
+        default = bool(os.environ.get("CLOUD_SQL_INSTANCE_CONNECTION_NAME"))
+        return _env_flag("CLOUD_SQL_USE_CONNECTOR", default=default)
+
+    def _ensure_cloud_sql_connector(self):
+        if self._cloud_sql_connector is None:
+            try:
+                from google.cloud.sql.connector import Connector  # type: ignore
+            except ImportError as exc:  # pragma: no cover - import guard
+                raise RuntimeError(
+                    "google-cloud-sql-python-connector is required when Cloud SQL connectivity is enabled."
+                ) from exc
+            self._cloud_sql_connector = Connector()
+        if not self._cloud_sql_connector_registered:
+            atexit.register(self._cloud_sql_connector.close)
+            self._cloud_sql_connector_registered = True
+        return self._cloud_sql_connector
+
+    def _cloud_sql_config(self) -> dict[str, Any]:
+        try:
+            from google.cloud.sql.connector import IPTypes  # type: ignore
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "google-cloud-sql-python-connector is required when Cloud SQL connectivity is enabled."
+            ) from exc
+
+        config = {
+            "instance_connection_name": os.environ.get("CLOUD_SQL_INSTANCE_CONNECTION_NAME"),
+            "db_user": os.environ.get("CLOUD_SQL_DB_USER"),
+            "db_password": os.environ.get("CLOUD_SQL_DB_PASSWORD"),
+            "db_name": os.environ.get("CLOUD_SQL_DB_NAME"),
+        }
+        missing = [key for key, value in config.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "Missing Cloud SQL connector environment variables: " + ", ".join(sorted(missing))
+            )
+
+        ip_pref = (os.environ.get("CLOUD_SQL_IP_TYPE", "PUBLIC") or "PUBLIC").strip().upper()
+        ip_type = IPTypes.PRIVATE if ip_pref == "PRIVATE" else IPTypes.PUBLIC
+
+        driver = (os.environ.get("CLOUD_SQL_CONNECTOR_DRIVER") or "psycopg").strip()
+        if not driver:
+            driver = "psycopg"
+
+        return {
+            **config,
+            "ip_type": ip_type,
+            "driver": driver,
+        }
+
+    def _create_connector_engine(self, *, echo: bool) -> Engine:
+        settings = self._cloud_sql_config()
+        connector = self._ensure_cloud_sql_connector()
+        driver = settings["driver"]
+        sqlalchemy_url = f"postgresql+{driver}://"
+
+        def getconn():
+            return connector.connect(
+                settings["instance_connection_name"],
+                driver,
+                user=settings["db_user"],
+                password=settings["db_password"],
+                db=settings["db_name"],
+                ip_type=settings["ip_type"],
+            )
+
+        self._logger.info(
+            "Connecting to Cloud SQL instance %s via %s driver.",
+            settings["instance_connection_name"],
+            driver,
+        )
+        return create_engine(
+            sqlalchemy_url,
+            creator=getconn,
+            pool_pre_ping=True,
+            echo=echo,
+            future=True,
+        )
 
 
 __all__ = [

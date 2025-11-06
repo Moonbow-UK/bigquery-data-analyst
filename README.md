@@ -54,6 +54,15 @@ python3 bigquery.py --dataset PROJECT_ID.DATASET --csv ./exports
 python3 bigquery.py --table DATASET.TABLE --csv
 ```
 
+### Environment variables (local vs Cloud Run)
+
+- **Local development** – keep using the `.env` file checked into your workspace. `load_environment()`
+  loads it automatically (via `python-dotenv`) when the Cloud Run markers are absent.
+- **Cloud Run deployments** – secrets should be injected as environment variables via Secret Manager.
+  Cloud Run sets `K_SERVICE` / `K_REVISION`, so `.env` loading is skipped automatically. If you ever need
+  to force `.env` parsing inside a container (for example when running Cloud Run locally with
+  `docker run`), set `FORCE_DOTENV=1`.
+
 When you omit the output argument, the script saves tables as `PROJECT_DATASET_TABLE.csv` (or dataset exports inside a `PROJECT_DATASET_csv/` directory) in the current working directory.
 
 Notes:
@@ -111,6 +120,28 @@ def embed_row(row: dict[str, Any]) -> list[float]:
 vector_adapter = VectorStoreAdapter(vector_client, vectoriser=embed_row)
 vector_adapter.persist_batch(batch, namespace="daily_snapshot")
 ```
+
+### Cloud SQL connector (recommended for production)
+
+When deploying on GCP you can bypass manual connection strings and let the
+[Google Cloud SQL Python Connector](https://cloud.google.com/sql/docs/postgres/connect-connectors#python)
+handle authentication + secure networking. Set the following environment variables (the connector is
+automatically enabled when the instance name is provided, or explicitly via `CLOUD_SQL_USE_CONNECTOR`):
+
+```
+CLOUD_SQL_INSTANCE_CONNECTION_NAME=project:region:instance
+CLOUD_SQL_DB_USER=my_user
+CLOUD_SQL_DB_PASSWORD=super_secret
+CLOUD_SQL_DB_NAME=analytics
+# Optional overrides:
+# CLOUD_SQL_USE_CONNECTOR=true        # defaults to true when the instance name is set
+# CLOUD_SQL_IP_TYPE=PRIVATE           # defaults to PUBLIC
+# CLOUD_SQL_CONNECTOR_DRIVER=psycopg2 # defaults to psycopg
+```
+
+Every surface that relies on `PersistenceService` (Flask app, CLI helpers, `scripts/manage_summaries.py`)
+now shares this connector-aware SQLAlchemy engine. Unset `CLOUD_SQL_INSTANCE_CONNECTION_NAME` (or set
+`CLOUD_SQL_USE_CONNECTOR=false`) to fall back to a regular `DATABASE_URL` for local development.
 
 ## Dataset summary helper
 
