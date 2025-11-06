@@ -168,6 +168,14 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 class PersistenceService:
     """Controls whether we persist to PostgreSQL or fall back to CSV mode."""
 
@@ -272,7 +280,7 @@ class PersistenceService:
                     )
 
     def _should_use_cloud_sql_connector(self) -> bool:
-        default = bool(os.environ.get("CLOUD_SQL_INSTANCE_CONNECTION_NAME"))
+        default = bool(_first_env("CLOUD_SQL_INSTANCE_CONNECTION_NAME", "INSTANCE_CONNECTION_NAME"))
         return _env_flag("CLOUD_SQL_USE_CONNECTOR", default=default)
 
     def _ensure_cloud_sql_connector(self):
@@ -298,10 +306,13 @@ class PersistenceService:
             ) from exc
 
         config = {
-            "instance_connection_name": os.environ.get("CLOUD_SQL_INSTANCE_CONNECTION_NAME"),
-            "db_user": os.environ.get("CLOUD_SQL_DB_USER"),
-            "db_password": os.environ.get("CLOUD_SQL_DB_PASSWORD"),
-            "db_name": os.environ.get("CLOUD_SQL_DB_NAME"),
+            "instance_connection_name": _first_env(
+                "CLOUD_SQL_INSTANCE_CONNECTION_NAME",
+                "INSTANCE_CONNECTION_NAME",
+            ),
+            "db_user": _first_env("CLOUD_SQL_DB_USER", "POSTGRES_USER"),
+            "db_password": _first_env("CLOUD_SQL_DB_PASSWORD", "POSTGRES_PASSWORD"),
+            "db_name": _first_env("CLOUD_SQL_DB_NAME", "POSTGRES_DB"),
         }
         missing = [key for key, value in config.items() if not value]
         if missing:

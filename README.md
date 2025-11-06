@@ -138,13 +138,15 @@ vector_adapter.persist_batch(batch, namespace="daily_snapshot")
 When deploying on GCP you can bypass manual connection strings and let the
 [Google Cloud SQL Python Connector](https://cloud.google.com/sql/docs/postgres/connect-connectors#python)
 handle authentication + secure networking. Set the following environment variables (the connector is
-automatically enabled when the instance name is provided, or explicitly via `CLOUD_SQL_USE_CONNECTOR`):
+automatically enabled when the instance name is provided, or explicitly via `CLOUD_SQL_USE_CONNECTOR`).
+Secret Manager entries exposed as `POSTGRES_*` or `INSTANCE_CONNECTION_NAME` are also picked up, so you
+can reuse those names without duplicating values:
 
 ```
-CLOUD_SQL_INSTANCE_CONNECTION_NAME=project:region:instance
-CLOUD_SQL_DB_USER=my_user
-CLOUD_SQL_DB_PASSWORD=super_secret
-CLOUD_SQL_DB_NAME=analytics
+CLOUD_SQL_INSTANCE_CONNECTION_NAME=project:region:instance   # or INSTANCE_CONNECTION_NAME
+CLOUD_SQL_DB_USER=my_user                                   # or POSTGRES_USER
+CLOUD_SQL_DB_PASSWORD=super_secret                          # or POSTGRES_PASSWORD
+CLOUD_SQL_DB_NAME=analytics                                 # or POSTGRES_DB
 # Optional overrides:
 # CLOUD_SQL_USE_CONNECTOR=true        # defaults to true when the instance name is set
 # CLOUD_SQL_IP_TYPE=PRIVATE           # defaults to PUBLIC
