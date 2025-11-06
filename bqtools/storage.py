@@ -279,6 +279,18 @@ def list_remote_export_relpaths(*, suffix: str | None = None) -> list[Path]:
     return results
 
 
+def storage_display_path(path: Path) -> str:
+    relative = relative_to_export_root(path)
+    rel_str = relative.as_posix().lstrip("/") if relative is not None else None
+    if USE_GCS_EXPORTS and GCS_BUCKET_NAME and rel_str is not None:
+        prefix = GCS_EXPORT_PREFIX.strip("/")
+        path_part = f"{prefix}/{rel_str}" if prefix else rel_str
+        return f"gs://{GCS_BUCKET_NAME}/{path_part}" if path_part else f"gs://{GCS_BUCKET_NAME}"
+    if rel_str is not None:
+        return f"var/exports/{rel_str}"
+    return str(path)
+
+
 __all__ = [
     "CSV_EXPORT_DIR",
     "EXPORT_ROOT",
@@ -298,4 +310,5 @@ __all__ = [
     "relative_to_export_root",
     "storage_context",
     "sync_export_artifact",
+    "storage_display_path",
 ]

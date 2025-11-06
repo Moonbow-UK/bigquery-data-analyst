@@ -44,6 +44,7 @@ from bqtools.storage import (
     export_file_exists,
     mirror_log_file,
     relative_to_export_root,
+    storage_display_path,
     sync_export_artifact,
 )
 from bqtools.services.dataset_summary import BaseCloudError
@@ -1195,6 +1196,8 @@ def build_summary_for_range(
             notes.append(note)
 
             if db_enabled and db_session is not None and job_record is not None:
+                display_csv_path = storage_display_path(csv_path)
+                display_json_path = storage_display_path(json_path)
                 export_record = SummaryExport(
                     job_id=job_record.id,
                     table_name=table_name,
@@ -1204,8 +1207,8 @@ def build_summary_for_range(
                     reused_cache=csv_rows is None,
                     csv_row_count=csv_rows,
                     json_row_count=json_rows,
-                    csv_path=str(csv_path),
-                    json_path=str(json_path),
+                    csv_path=display_csv_path,
+                    json_path=display_json_path,
                     exported_at=_now_utc(),
                     notes=note,
                     intraday_fallback=using_fallback and bool(export.get("fallback_table_name")),
@@ -1301,7 +1304,7 @@ def build_summary_for_range(
             report_record = SummaryReport(
                 job_id=job_record.id,
                 summary_mode=summary.get("mode") or "csv",
-                csv_summary_path=str(summary_csv_path),
+                csv_summary_path=storage_display_path(summary_csv_path),
                 total_events=total_events_payload,
                 dataset_snapshot=_jsonify(summary.get("dataset")),
                 sections_json=_jsonify(summary.get("csv_sections")),

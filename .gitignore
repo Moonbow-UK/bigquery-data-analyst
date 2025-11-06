@@ -17,3 +17,5 @@ var/logs/
 var/exports/
 *.mmd
 gcr-variable.txt
+env_exports.txt
+temp.db
