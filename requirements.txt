@@ -1,15 +1,15 @@
-google-cloud-bigquery>=3.11.0
-google-auth>=2.20.0
-Flask>=2.3.0
-python-dotenv>=1.0.0
-SQLAlchemy>=2.0.0
-psycopg[binary]>=3.1.8
-openai>=1.12.0
-pinecone>=4.0.0
-requests>=2.31.0
-markdown-it-py>=2.2.0
-gunicorn>=21.2.0
-psycopg2-binary        # For PostgreSQL
-google-cloud-storage   # For the 50GB of GCS files
-google-cloud-sql-python-connector[psycopg2] # THE BEST way to connect to Cloud SQL
+google-cloud-bigquery
+google-auth
+Flask
+python-dotenv
+SQLAlchemy
+psycopg[binary]
+openai
+pinecone
+requests
+markdown-it-py
+gunicorn
+psycopg2-binary 
+google-cloud-storage
+google-cloud-sql-python-connector[psycopg2]
 pinecone-client
