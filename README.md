@@ -63,6 +63,18 @@ python3 bigquery.py --table DATASET.TABLE --csv
   to force `.env` parsing inside a container (for example when running Cloud Run locally with
   `docker run`), set `FORCE_DOTENV=1`.
 
+### Artifact storage (exports + logs)
+
+- Set `GCS_APP_BUCKET` (or `APP_STORAGE_BUCKET`) to the bucket that should hold exported CSV/JSON assets
+  plus application logs. When running on Cloud Run the app automatically stages files under `/tmp/var/*`
+  and mirrors them to `gs://$GCS_APP_BUCKET/exports` for data and `gs://$GCS_APP_BUCKET/var/logs` for logs,
+  while local development still writes to `var/exports`.
+- Override prefixes with `GCS_EXPORT_PREFIX` / `GCS_LOG_PREFIX` if needed (defaults match the paths
+  above). Locally you can keep everything under `var/`, or set `FORCE_GCS_STORAGE=1` to exercise the
+  Cloud Storage mirroring behaviour outside Cloud Run.
+- Customise the local staging directories via `APP_EXPORT_ROOT` / `APP_LOG_ROOT` when required (for
+  example pointing them at a mounted volume during integration tests).
+
 When you omit the output argument, the script saves tables as `PROJECT_DATASET_TABLE.csv` (or dataset exports inside a `PROJECT_DATASET_csv/` directory) in the current working directory.
 
 Notes:

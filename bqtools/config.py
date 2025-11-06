@@ -17,7 +17,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _running_in_cloud_run() -> bool:
+def running_in_cloud_run() -> bool:
     cloud_run_markers = ("K_SERVICE", "K_REVISION", "K_CONFIGURATION")
     return any(os.environ.get(marker) for marker in cloud_run_markers)
 
@@ -28,7 +28,7 @@ def load_environment(dotenv_path: str | os.PathLike[str] | None = None) -> None:
         return
 
     # Cloud Run receives secrets as environment variables, so skip .env loading unless explicitly forced.
-    if _running_in_cloud_run() and not _env_flag("FORCE_DOTENV", False):
+    if running_in_cloud_run() and not _env_flag("FORCE_DOTENV", False):
         return
 
     if dotenv_path:
