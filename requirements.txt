@@ -8,3 +8,4 @@ openai>=1.12.0
 pinecone>=4.0.0
 requests>=2.31.0
 markdown-it-py>=2.2.0
+gunicorn>=21.2.0
