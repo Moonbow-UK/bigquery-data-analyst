@@ -62,6 +62,8 @@ python3 bigquery.py --table DATASET.TABLE --csv
   Cloud Run sets `K_SERVICE` / `K_REVISION`, so `.env` loading is skipped automatically. If you ever need
   to force `.env` parsing inside a container (for example when running Cloud Run locally with
   `docker run`), set `FORCE_DOTENV=1`.
+- The Flask app and CLI helpers share the same storage layer, so Cloud Run jobs automatically stage files
+  under `/tmp/var/*` and mirror them to your GCS bucket without changing local workflows.
 
 ### Artifact storage (exports + logs)
 

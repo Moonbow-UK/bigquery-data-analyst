@@ -21,7 +21,6 @@ from pinecone import Pinecone
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from google.api_core import exceptions as gcloud_exceptions
-from google.cloud import storage
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -35,7 +34,18 @@ from bqtools import (
     build_client,
 )
 from bqtools.api import SummaryAPIConfig, create_summary_blueprint
-from bqtools.config import default_credentials_file, load_environment, running_in_cloud_run
+from bqtools.config import default_credentials_file, load_environment
+from bqtools.storage import (
+    CSV_EXPORT_DIR,
+    EXPORT_ROOT,
+    JSON_EXPORT_DIR,
+    LOG_DIR,
+    ensure_local_export_file,
+    export_file_exists,
+    mirror_log_file,
+    relative_to_export_root,
+    sync_export_artifact,
+)
 from bqtools.services.dataset_summary import BaseCloudError
 from bqtools.services.persistence import (
     Dataset,
@@ -54,14 +64,6 @@ def _env_flag_from_str(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 DEBUG_MODE = _env_flag_from_str(os.environ.get("DEBUG_MODE"), False)
-RUNNING_IN_CLOUD_RUN = running_in_cloud_run()
-FORCE_GCS_STORAGE = _env_flag_from_str(os.environ.get("FORCE_GCS_STORAGE"), False)
-GCS_BUCKET_NAME = os.environ.get("GCS_APP_BUCKET") or os.environ.get("APP_STORAGE_BUCKET")
-GCS_EXPORT_PREFIX = os.environ.get("GCS_EXPORT_PREFIX", "exports")
-GCS_LOG_PREFIX = os.environ.get("GCS_LOG_PREFIX", "var/logs")
-USE_GCS_STORAGE = bool(GCS_BUCKET_NAME) and (RUNNING_IN_CLOUD_RUN or FORCE_GCS_STORAGE)
-USE_GCS_EXPORTS = USE_GCS_STORAGE
-USE_GCS_LOGS = USE_GCS_STORAGE
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "change-me")
@@ -128,20 +130,11 @@ class DailyPrefixedFileHandler(BaseRotatingHandler):
     def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
         super().emit(record)
         try:
-            _mirror_log_file(Path(self.baseFilename))
+            mirror_log_file(Path(self.baseFilename))
         except Exception as exc:  # pragma: no cover - best effort
-            storage_logger.debug("Failed to mirror log file %s: %s", self.baseFilename, exc)
-
-_STATE_ROOT = Path("/tmp") if RUNNING_IN_CLOUD_RUN else Path(".")
-
-LOG_DIR = Path(os.environ.get("APP_LOG_ROOT", str(_STATE_ROOT / "var/logs")))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-EXPORT_ROOT = Path(os.environ.get("APP_EXPORT_ROOT", str(_STATE_ROOT / "var/exports")))
-CSV_EXPORT_DIR = EXPORT_ROOT / "csv"
-JSON_EXPORT_DIR = EXPORT_ROOT / "json"
-for export_dir in (CSV_EXPORT_DIR, JSON_EXPORT_DIR):
-    export_dir.mkdir(parents=True, exist_ok=True)
+            logger.getChild("storage").debug(
+                "Failed to mirror log file %s: %s", self.baseFilename, exc
+            )
 
 logger = logging.getLogger("summary_app")
 if not logger.handlers:
@@ -160,125 +153,6 @@ logger.propagate = False
 
 if DEBUG_MODE:
     logger.debug("Debug mode enabled for summary_app.")
-
-storage_logger = logger.getChild("storage")
-_STORAGE_CLIENT: storage.Client | None = None
-_STORAGE_BUCKET: Any | None = None
-_LOG_UPLOAD_MTIMES: dict[Path, float] = {}
-
-
-def _storage_active() -> bool:
-    return USE_GCS_STORAGE and bool(GCS_BUCKET_NAME)
-
-
-def _get_storage_bucket() -> Any | None:
-    if not _storage_active():
-        return None
-    global _STORAGE_CLIENT, _STORAGE_BUCKET
-    if _STORAGE_CLIENT is None:
-        try:
-            _STORAGE_CLIENT = storage.Client()
-        except Exception as exc:  # pragma: no cover - client init
-            storage_logger.error("Failed to initialise Cloud Storage client: %s", exc)
-            return None
-    if _STORAGE_BUCKET is None and GCS_BUCKET_NAME:
-        _STORAGE_BUCKET = _STORAGE_CLIENT.bucket(GCS_BUCKET_NAME)
-    return _STORAGE_BUCKET
-
-
-def _build_blob_name(prefix: str, relative_path: Path) -> str:
-    prefix = (prefix or "").strip("/")
-    relative = relative_path.as_posix().lstrip("/")
-    if prefix and relative:
-        return f"{prefix}/{relative}"
-    if prefix:
-        return prefix
-    return relative
-
-
-def _relative_to_base(path: Path, base_dir: Path) -> Path | None:
-    try:
-        return path.relative_to(base_dir)
-    except ValueError:
-        return None
-
-
-def _download_from_gcs(path: Path, *, base_dir: Path, prefix: str) -> None:
-    if not _storage_active() or not GCS_BUCKET_NAME:
-        return
-    relative = _relative_to_base(path, base_dir)
-    if relative is None:
-        return
-    bucket = _get_storage_bucket()
-    client = _STORAGE_CLIENT
-    if bucket is None or client is None:
-        return
-    blob_name = _build_blob_name(prefix, relative)
-    blob = bucket.blob(blob_name)
-    try:
-        exists = blob.exists(client=client)
-    except Exception as exc:  # pragma: no cover - network failure
-        storage_logger.warning("Unable to check Cloud Storage blob %s: %s", blob_name, exc)
-        return
-    if not exists:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        blob.download_to_filename(path)
-        storage_logger.debug("Downloaded %s to %s", blob_name, path)
-    except Exception as exc:  # pragma: no cover - network failure
-        storage_logger.warning("Failed to download %s: %s", blob_name, exc)
-
-
-def _upload_to_gcs(path: Path, *, base_dir: Path, prefix: str) -> None:
-    if not _storage_active() or not GCS_BUCKET_NAME:
-        return
-    if not path.exists():
-        return
-    relative = _relative_to_base(path, base_dir)
-    if relative is None:
-        return
-    bucket = _get_storage_bucket()
-    if bucket is None:
-        return
-    blob_name = _build_blob_name(prefix, relative)
-    blob = bucket.blob(blob_name)
-    try:
-        blob.upload_from_filename(path)
-        storage_logger.debug("Uploaded %s to gs://%s/%s", path, GCS_BUCKET_NAME, blob_name)
-    except Exception as exc:  # pragma: no cover - network failure
-        storage_logger.warning("Failed to upload %s to %s: %s", path, blob_name, exc)
-
-
-def _ensure_local_export_file(path: Path) -> None:
-    if USE_GCS_EXPORTS:
-        _download_from_gcs(path, base_dir=EXPORT_ROOT, prefix=GCS_EXPORT_PREFIX)
-
-
-def _sync_export_artifact(path: Path) -> None:
-    if USE_GCS_EXPORTS:
-        _upload_to_gcs(path, base_dir=EXPORT_ROOT, prefix=GCS_EXPORT_PREFIX)
-
-
-def _export_file_exists(path: Path) -> bool:
-    _ensure_local_export_file(path)
-    return path.exists()
-
-
-def _mirror_log_file(path: Path) -> None:
-    if not USE_GCS_LOGS:
-        return
-    if not path.exists():
-        return
-    try:
-        mtime = path.stat().st_mtime
-    except FileNotFoundError:
-        return
-    last_upload = _LOG_UPLOAD_MTIMES.get(path)
-    if last_upload is not None and mtime <= last_upload:
-        return
-    _LOG_UPLOAD_MTIMES[path] = mtime
-    _upload_to_gcs(path, base_dir=LOG_DIR, prefix=GCS_LOG_PREFIX)
 
 
 persistence_service = PersistenceService(logger=logger.getChild("persistence"))
@@ -326,10 +200,10 @@ def _csv_export_path(project_id: str, dataset_id: str, table_name: str) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             legacy.replace(target)
             logger.info("Migrated legacy CSV %s to %s", legacy, target)
-            _sync_export_artifact(target)
+            sync_export_artifact(target)
         except OSError as exc:
             logger.warning("Unable to move legacy CSV %s to %s: %s", legacy, target, exc)
-    _ensure_local_export_file(target)
+    ensure_local_export_file(target)
     return target
 
 
@@ -342,10 +216,10 @@ def _json_export_path(project_id: str, dataset_id: str, table_name: str) -> Path
             target.parent.mkdir(parents=True, exist_ok=True)
             legacy.replace(target)
             logger.info("Migrated legacy JSON %s to %s", legacy, target)
-            _sync_export_artifact(target)
+            sync_export_artifact(target)
         except OSError as exc:
             logger.warning("Unable to move legacy JSON %s to %s: %s", legacy, target, exc)
-    _ensure_local_export_file(target)
+    ensure_local_export_file(target)
     return target
 
 
@@ -644,7 +518,7 @@ def _write_json_from_csv(csv_path: Path, json_path: Path) -> int:
         for row in reader:
             json_file.write(json.dumps(row, ensure_ascii=False) + "\n")
             row_count += 1
-    _sync_export_artifact(json_path)
+    sync_export_artifact(json_path)
     return row_count
 
 
@@ -680,7 +554,7 @@ def _combine_csv_files(csv_paths: list[Path], output_path: Path) -> int:
         except FileNotFoundError:
             pass
         raise ValueError("No data available to combine for the selected date range.")
-    _sync_export_artifact(output_path)
+    sync_export_artifact(output_path)
     return total_rows
 
 
@@ -1164,7 +1038,7 @@ def build_summary_for_range(
                 selected_candidate = candidates[0]
             else:
                 selected_candidate = next(
-                    (c for c in candidates if _export_file_exists(Path(c["csv_path"]))),
+                    (c for c in candidates if export_file_exists(Path(c["csv_path"]))),
                     None,
                 )
                 if selected_candidate is None:
@@ -1185,7 +1059,7 @@ def build_summary_for_range(
                 "Preparing export for table %s (kind=%s, needs_csv=%s, fallback=%s)",
                 full_table_id,
                 table_kind,
-                not _export_file_exists(csv_path),
+                not export_file_exists(csv_path),
                 using_fallback,
             )
 
@@ -1194,7 +1068,7 @@ def build_summary_for_range(
             csv_rows: int | None = None
             json_rows: int | None = None
 
-            needs_export = force_refresh or not _export_file_exists(csv_path)
+            needs_export = force_refresh or not export_file_exists(csv_path)
 
             if needs_export:
                 if force_refresh:
@@ -1244,7 +1118,7 @@ def build_summary_for_range(
                         table_name = candidate_table_name
                         full_table_id = candidate_full_id
                         csv_path = candidate_csv_path
-                        _sync_export_artifact(csv_path)
+                        sync_export_artifact(csv_path)
                         json_path = candidate_json_path
                         table_kind = candidate_kind
                         using_fallback = table_name != primary_table_name
@@ -1282,9 +1156,9 @@ def build_summary_for_range(
                     0.4,
                 )
 
-            json_refresh_needed = force_refresh or not _export_file_exists(json_path)
+            json_refresh_needed = force_refresh or not export_file_exists(json_path)
             if json_refresh_needed:
-                if force_refresh and _export_file_exists(json_path):
+                if force_refresh and export_file_exists(json_path):
                     try:
                         json_path.unlink()
                     except FileNotFoundError:
@@ -1966,8 +1840,8 @@ def check_summary():
 
     def _path_exists(path_like: Path | str) -> bool:
         candidate = path_like if isinstance(path_like, Path) else Path(str(path_like))
-        if _relative_to_base(candidate, EXPORT_ROOT) is not None:
-            return _export_file_exists(candidate)
+        if relative_to_export_root(candidate) is not None:
+            return export_file_exists(candidate)
         return candidate.exists()
 
     paths_available = all(_path_exists(export["csv_path"]) for export in exports)

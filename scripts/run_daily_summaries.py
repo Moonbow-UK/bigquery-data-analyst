@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bqtools.config import load_environment
+from bqtools.storage import CSV_EXPORT_DIR, export_modified_time
 from bqtools.services.persistence import Dataset, PersistenceService, SummaryJob
 
 LOGGER = logging.getLogger("daily_summaries")
@@ -80,17 +81,16 @@ def _intraday_prefix() -> str:
 
 
 def _intraday_csv_path(project: str, dataset_id: str, target_date: date) -> Path:
-    export_root = Path("var/exports/csv")
-    export_root.mkdir(parents=True, exist_ok=True)
+    export_root = CSV_EXPORT_DIR
     date_str = target_date.strftime("%Y%m%d")
     filename = f"{project}_{dataset_id}_{_intraday_prefix()}{date_str}.csv"
     return export_root / filename
 
 
 def _is_stale(path: Path) -> tuple[bool, datetime | None]:
-    if not path.exists():
+    modified = export_modified_time(path)
+    if modified is None:
         return False, None
-    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     age = datetime.now(timezone.utc) - modified
     return age > STALE_THRESHOLD, modified
 

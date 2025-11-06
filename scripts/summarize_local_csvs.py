@@ -28,12 +28,20 @@ if str(ROOT) not in sys.path:  # ensure local packages (bqtools, app) are import
     sys.path.insert(0, str(ROOT))
 
 from bqtools.config import load_environment
+from bqtools.storage import (
+    CSV_EXPORT_DIR,
+    EXPORT_ROOT,
+    ensure_local_export_file,
+    export_file_exists,
+    list_remote_export_relpaths,
+    sync_export_artifact,
+)
 from bqtools.services.dataset_summary import DatasetSummaryOptions
 
 import app
 
 LOGGER = logging.getLogger("csv_range_summary")
-CHECKSUM_MANIFEST_PATH = app.EXPORT_ROOT / "checksums.json"
+CHECKSUM_MANIFEST_PATH = EXPORT_ROOT / "checksums.json"
 
 
 def _parse_date(value: str) -> date:
@@ -73,13 +81,13 @@ def _collect_available_exports(exports: list[dict]) -> list[Path]:
     available: list[Path] = []
     for export in exports:
         csv_path = Path(export["csv_path"])
-        if csv_path.exists():
+        if export_file_exists(csv_path):
             available.append(csv_path)
             continue
         fallback_path = export.get("fallback_csv_path")
         if fallback_path:
             fallback = Path(fallback_path)
-            if fallback.exists():
+            if export_file_exists(fallback):
                 available.append(fallback)
     return available
 
@@ -92,8 +100,13 @@ def _discover_local_dates(
 ) -> list[date]:
     prefix = f"{project_id}_{dataset_id}_"
     discovered: set[date] = set()
-    for csv_path in app.CSV_EXPORT_DIR.glob("*.csv"):
-        name = csv_path.name
+    filenames = {path.name for path in CSV_EXPORT_DIR.glob("*.csv")}
+    for rel_path in list_remote_export_relpaths(suffix=".csv"):
+        parts = rel_path.parts
+        if parts and parts[0] != "csv":
+            continue
+        filenames.add(rel_path.name)
+    for name in filenames:
         if not name.startswith(prefix) or not name.endswith(".csv"):
             continue
         table_part = name[len(prefix) : -4]
@@ -115,8 +128,9 @@ def _discover_local_dates(
 
 
 def _load_checksum_manifest() -> dict[str, dict[str, str | None]]:
-    if not CHECKSUM_MANIFEST_PATH.exists():
+    if not export_file_exists(CHECKSUM_MANIFEST_PATH):
         return {}
+    ensure_local_export_file(CHECKSUM_MANIFEST_PATH)
     try:
         with CHECKSUM_MANIFEST_PATH.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -149,12 +163,14 @@ def _save_checksum_manifest(manifest: dict[str, dict[str, str | None]]) -> None:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
     tmp_path.replace(CHECKSUM_MANIFEST_PATH)
+    sync_export_artifact(CHECKSUM_MANIFEST_PATH)
 
 
 def _compute_checksum(path: Path, *, chunk_size: int = 1 << 20) -> str:
     import hashlib
 
     hasher = hashlib.md5()
+    ensure_local_export_file(path)
     with path.open("rb") as fh:
         while chunk := fh.read(chunk_size):
             hasher.update(chunk)
@@ -187,7 +203,7 @@ def _identify_out_of_sync_pairs(
 ) -> set[Path]:
     refresh_paths: set[Path] = set()
     for csv_path, json_path in pairs:
-        if not csv_path.exists():
+        if not export_file_exists(csv_path):
             continue
         key = str(csv_path)
         record = manifest.get(key)
@@ -196,7 +212,7 @@ def _identify_out_of_sync_pairs(
         except OSError as exc:
             LOGGER.warning("Unable to read CSV %s for checksum: %s", csv_path, exc)
             continue
-        json_exists = json_path.exists()
+        json_exists = export_file_exists(json_path)
         json_checksum: str | None = None
         if json_exists:
             try:
@@ -242,7 +258,7 @@ def _refresh_json_exports(
             path = Path(path_like)
             if path in seen:
                 continue
-            if not path.exists():
+            if not export_file_exists(path):
                 if refresh:
                     seen.add(path)
                 continue
@@ -406,7 +422,7 @@ def _record_checksums(
 ) -> None:
     for csv_path, json_path in pairs:
         key = str(csv_path)
-        if not csv_path.exists():
+        if not export_file_exists(csv_path):
             if key in manifest:
                 LOGGER.debug("Removing manifest entry for missing CSV %s.", csv_path)
                 manifest.pop(key, None)
@@ -417,7 +433,7 @@ def _record_checksums(
             LOGGER.warning("Unable to record checksum for CSV %s: %s", csv_path, exc)
             continue
         json_checksum: str | None = None
-        if json_path.exists():
+        if export_file_exists(json_path):
             try:
                 json_checksum = _compute_checksum(json_path)
             except OSError as exc:
@@ -506,7 +522,7 @@ def main() -> int:
             intraday_prefix=intraday_prefix,
         )
         if not target_dates:
-            LOGGER.warning("No local CSV exports found under %s.", app.CSV_EXPORT_DIR)
+            LOGGER.warning("No local CSV exports found under %s.", CSV_EXPORT_DIR)
     else:
         if args.start_date is None:
             parser.error("--start-date is required unless --all is used.")
