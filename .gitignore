@@ -9,6 +9,7 @@ __pycache__/
 
 # Environment files
 .env
+.env*
 oauth_credentials.json
 *.csv
 *.json
