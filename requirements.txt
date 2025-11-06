@@ -11,5 +11,5 @@ markdown-it-py
 gunicorn
 psycopg2-binary 
 google-cloud-storage
-google-cloud-sql-python-connector[psycopg2]
+cloud-sql-python-connector[pg8000]
 pinecone-client
