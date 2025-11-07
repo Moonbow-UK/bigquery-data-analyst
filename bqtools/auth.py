@@ -14,14 +14,25 @@ DEFAULT_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/bigquery",)
 
 def load_credentials(path: Path, scopes: Sequence[str] | None = None) -> Credentials:
     """Load either OAuth user or service account credentials."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Credentials file not found at {path}. "
-            "Download an OAuth 'authorized_user' JSON or a service account key and point the script to it."
-        )
+    expanded_path = path.expanduser()
+    raw_value = str(expanded_path)
+    inline_json = raw_value.lstrip().startswith("{") and raw_value.rstrip().endswith("}")
 
-    with path.open("r", encoding="utf-8") as fh:
-        credential_info: Dict[str, Any] = json.load(fh)
+    if inline_json:
+        try:
+            credential_info = json.loads(raw_value)
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            raise RuntimeError(
+                "BIGQUERY_CREDENTIALS_FILE appears to contain inline JSON but it could not be parsed."
+            ) from exc
+    else:
+        if not expanded_path.exists():
+            raise FileNotFoundError(
+                f"Credentials file not found at {expanded_path}. "
+                "Download an OAuth 'authorized_user' JSON or a service account key and point the script to it."
+            )
+        with expanded_path.open("r", encoding="utf-8") as fh:
+            credential_info = json.load(fh)
 
     scopes_tuple = tuple(scopes) if scopes else DEFAULT_SCOPES
     credentials_type = credential_info.get("type")

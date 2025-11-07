@@ -25,6 +25,11 @@ source .venv/bin/activate
 export BIGQUERY_CREDENTIALS_FILE=/absolute/path/to/your/key.json
 ```
 
+   When running on Cloud Run (or any environment where you inject secrets as raw environment variables)
+   you can map the secret value directly to `BIGQUERY_CREDENTIALS_FILE`. If the variable contains inline
+   JSON (begins with `{`), the loader treats it as credential content instead of a filesystem path, so you
+   do not need to write the secret to disk.
+
 3. Run the connectivity script:
 
 ```bash
