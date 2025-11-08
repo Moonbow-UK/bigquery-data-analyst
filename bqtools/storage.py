@@ -198,10 +198,13 @@ def download_export_artifact(path: Path) -> bool:
     return path.exists()
 
 
-def _upload_to_gcs(path: Path, *, prefix: str) -> None:
+def _upload_to_gcs(path: Path, *, prefix: str, base_dir: Path | None = None) -> None:
     if not path.exists() or not GCS_BUCKET_NAME:
         return
-    relative = relative_to_export_root(path)
+    if base_dir is None:
+        relative = relative_to_export_root(path)
+    else:
+        relative = _relative_to_base(path, base_dir)
     if relative is None:
         return
     bucket = _get_bucket()
@@ -279,7 +282,7 @@ def mirror_log_file(path: Path) -> None:
     if last_uploaded is not None and mtime <= last_uploaded:
         return
     _LOG_UPLOAD_MTIMES[path] = mtime
-    _upload_to_gcs(path, prefix=GCS_LOG_PREFIX)
+    _upload_to_gcs(path, prefix=GCS_LOG_PREFIX, base_dir=LOG_DIR)
 
 
 def list_remote_export_relpaths(*, suffix: str | None = None) -> list[Path]:
