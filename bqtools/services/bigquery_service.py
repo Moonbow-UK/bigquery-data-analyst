@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from google.cloud import bigquery
 
@@ -145,11 +145,27 @@ class BigQueryService:
         full_table_id = self.normalize_table_identifier(table_id)
         supported_strategies = ("gcs_extract", "storage_api", "query_api")
         preferred = self._export_mode if self._export_mode in supported_strategies else "query_api"
-        strategy_order: list[str] = [preferred]
-        if self._allow_export_fallback:
+
+        table_has_nested_fields = self._table_has_nested_schema(full_table_id)
+        skip_gcs_extract = preferred == "gcs_extract" and table_has_nested_fields
+        strategy_order: list[str] = []
+        if skip_gcs_extract:
+            logger.info(
+                "Skipping gcs_extract for %s because the schema contains nested/repeated fields.",
+                full_table_id,
+            )
+        else:
+            strategy_order.append(preferred)
+
+        allow_fallback = self._allow_export_fallback or skip_gcs_extract
+        if allow_fallback:
             for candidate in supported_strategies:
+                if candidate == "gcs_extract" and skip_gcs_extract:
+                    continue
                 if candidate not in strategy_order:
                     strategy_order.append(candidate)
+        if not strategy_order:
+            strategy_order.append("query_api")
 
         last_error: Exception | None = None
         for strategy in strategy_order:
@@ -319,6 +335,24 @@ class BigQueryService:
         if self._bqstorage_client is None:
             self._bqstorage_client = bigquery_storage_v1.BigQueryReadClient()
         return self._bqstorage_client
+
+    def _table_has_nested_schema(self, full_table_id: str) -> bool:
+        try:
+            table = self._client.get_table(full_table_id)
+        except Exception:
+            return False
+        return self._schema_has_nested_fields(table.schema)
+
+    @staticmethod
+    def _schema_has_nested_fields(
+        schema: Sequence[bigquery.schema.SchemaField],
+    ) -> bool:
+        for field in schema:
+            if field.mode == "REPEATED" or field.field_type == "RECORD":
+                return True
+            if field.fields and BigQueryService._schema_has_nested_fields(field.fields):
+                return True
+        return False
 
     @staticmethod
     def _count_csv_rows(path: Path) -> int:
