@@ -123,6 +123,24 @@ def relative_to_export_root(path: Path) -> Path | None:
     return _relative_to_base(path, EXPORT_ROOT)
 
 
+def export_blob_uri(path: Path) -> str | None:
+    """
+    Build the gs:// URI for a file under the export root, respecting the configured prefix.
+
+    Returns None when Cloud Storage exports are disabled or the path cannot be mapped.
+    """
+    if not GCS_BUCKET_NAME:
+        return None
+    relative = relative_to_export_root(path)
+    if relative is None:
+        try:
+            relative = Path(path.name)
+        except Exception:  # pragma: no cover - defensive
+            return None
+    blob_name = _build_blob_name(GCS_EXPORT_PREFIX, relative)
+    return f"gs://{GCS_BUCKET_NAME}/{blob_name}"
+
+
 def _build_blob_name(prefix: str, relative_path: Path) -> str:
     clean_prefix = (prefix or "").strip("/")
     relative = relative_path.as_posix().lstrip("/")
@@ -133,8 +151,8 @@ def _build_blob_name(prefix: str, relative_path: Path) -> str:
     return relative
 
 
-def _download_from_gcs(path: Path, *, prefix: str) -> None:
-    if not USE_GCS_EXPORTS or not GCS_BUCKET_NAME:
+def _download_from_gcs(path: Path, *, prefix: str, force: bool = False) -> None:
+    if (not USE_GCS_EXPORTS and not force) or not GCS_BUCKET_NAME:
         return
     relative = relative_to_export_root(path)
     if relative is None:
@@ -162,6 +180,22 @@ def ensure_local_export_file(path: Path) -> None:
     if path.exists():
         return
     _download_from_gcs(path, prefix=GCS_EXPORT_PREFIX)
+
+
+def download_export_artifact(path: Path) -> bool:
+    """
+    Download an export file from GCS regardless of the local USE_GCS_EXPORTS toggle.
+    Returns True when a blob was downloaded successfully.
+    """
+    if path.exists():
+        return True
+    if not GCS_BUCKET_NAME:
+        return False
+    try:
+        _download_from_gcs(path, prefix=GCS_EXPORT_PREFIX, force=True)
+    except Exception:  # pragma: no cover - safety net
+        return False
+    return path.exists()
 
 
 def _upload_to_gcs(path: Path, *, prefix: str) -> None:

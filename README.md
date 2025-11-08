@@ -88,6 +88,16 @@ Notes:
 - For production usage prefer service-account credentials with the `google-cloud-bigquery` client.
 - The shared library layer makes it straightforward to add new surfaces (database writers, chat assistants, dashboards) without duplicating BigQuery plumbing.
 
+### BigQuery export strategies
+
+Use `BIGQUERY_EXPORT_MODE` to choose how tables are materialised when a CSV is required:
+
+- `gcs_extract` (default) — runs a BigQuery extract job that writes directly to `gs://$GCS_APP_BUCKET/$GCS_EXPORT_PREFIX/...`, then downloads the object to the local `var/exports` path. This keeps API usage low and is the recommended option for Cloud Run or any environment with bucket access. Requires `GCS_APP_BUCKET`/`APP_STORAGE_BUCKET`.
+- `storage_api` — streams rows through the BigQuery Storage API, which works well on laptops or environments without GCS access. Install the `google-cloud-bigquery-storage` and `pyarrow` dependencies and grant the service account the `bigquery.readsessions.create` permission.
+- `query_api` — legacy fallback that pages through `SELECT * FROM table`. Only use this when neither of the options above is available; it is slower and consumes far more API quota.
+
+Set the variable per process (e.g. `export BIGQUERY_EXPORT_MODE=storage_api`) to override the default. Fallbacks are disabled by default; set `BIGQUERY_EXPORT_MODE_FALLBACK=true` if you want the service to automatically try the remaining strategies when the preferred one fails.
+
 ### Bulk intraday exports
 
 When you need a rolling 15-day window of GA4 intraday data, use the helper script:
