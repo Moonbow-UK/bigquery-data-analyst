@@ -10,6 +10,7 @@ import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+import time
 from decimal import Decimal, DecimalException
 from logging.handlers import BaseRotatingHandler
 from pathlib import Path
@@ -1000,6 +1001,7 @@ def build_summary_for_range(
         total_units = len(exports) + (1 if normalized_range == "last7days" else 0) + 1
         tracker = ProgressTracker(total_units=total_units, callback=emit)
 
+        overall_timer = time.perf_counter()
         bigquery_service: BigQueryService | None = None
         notes: list[str] = []
         csv_paths_for_summary: list[Path] = []
@@ -1055,6 +1057,8 @@ def build_summary_for_range(
 
             using_fallback = table_name != primary_table_name
             status_bits: list[str] = []
+
+            table_timer = time.perf_counter()
 
             logger.info(
                 "Preparing export for table %s (kind=%s, needs_csv=%s, fallback=%s)",
@@ -1195,6 +1199,16 @@ def build_summary_for_range(
             note = f"{full_table_id}: {'; '.join(status_bits)}."
             notes.append(note)
 
+            table_elapsed = time.perf_counter() - table_timer
+            logger.info(
+                "Table %s ready in %.2fs (csv_rows=%s, json_rows=%s, fallback=%s)",
+                full_table_id,
+                table_elapsed,
+                csv_rows if csv_rows is not None else "cached",
+                json_rows if json_rows is not None else "cached",
+                using_fallback,
+            )
+
             if db_enabled and db_session is not None and job_record is not None:
                 display_csv_path = storage_display_path(csv_path)
                 display_json_path = storage_display_path(json_path)
@@ -1263,11 +1277,18 @@ def build_summary_for_range(
             _exit_csv_mode()
         _enter_csv_mode(summary_csv_path)
         tracker.update("summary", "Generating dataset summary", 0.3)
+        summary_timer = time.perf_counter()
         service = DatasetSummaryService(None)
         summary = service.build_summary(dataset=None, tables=[], options=options)
         if isinstance(summary, dict):
             summary["intraday_active"] = intraday_fallback_detected
         tracker.complete_unit("summary", f"Summary ready for {service.csv_path.name}")
+        summary_elapsed = time.perf_counter() - summary_timer
+        logger.info(
+            "Summary generation finished in %.2fs for %s",
+            summary_elapsed,
+            service.csv_path.name,
+        )
 
         summary_note = f"CSV mode active: summarising {service.csv_path.name}."
         details = " ".join(notes)
@@ -1343,6 +1364,12 @@ def build_summary_for_range(
         emit("note", summary_note, tracker.current_progress)
         emit("complete", "Summary generated successfully", 1.0)
 
+        total_elapsed = time.perf_counter() - overall_timer
+        logger.info(
+            "Completed summary run for %s in %.2fs",
+            normalized_range,
+            total_elapsed,
+        )
         return summary, filter_note
     except Exception as exc:
         if db_enabled and db_session is not None and job_record is not None:
