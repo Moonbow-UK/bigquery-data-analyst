@@ -12,6 +12,22 @@ from google.oauth2.credentials import Credentials
 DEFAULT_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/bigquery",)
 
 
+def _normalize_oauth_url(value: str | None) -> str | None:
+    """Ensure OAuth endpoints have the proper scheme syntax."""
+    if not value:
+        return value
+
+    stripped = value.strip()
+    if "://" in stripped:
+        return stripped
+
+    if stripped.startswith("https:/"):
+        return "https://" + stripped[len("https:/") :]
+    if stripped.startswith("http:/"):
+        return "http://" + stripped[len("http:/") :]
+    return stripped
+
+
 def load_credentials(path: Path, scopes: Sequence[str] | None = None) -> Credentials:
     """Load either OAuth user or service account credentials."""
     expanded_path = path.expanduser()
@@ -33,6 +49,10 @@ def load_credentials(path: Path, scopes: Sequence[str] | None = None) -> Credent
             )
         with expanded_path.open("r", encoding="utf-8") as fh:
             credential_info = json.load(fh)
+
+    normalized_token_uri = _normalize_oauth_url(credential_info.get("token_uri"))
+    if normalized_token_uri:
+        credential_info["token_uri"] = normalized_token_uri
 
     scopes_tuple = tuple(scopes) if scopes else DEFAULT_SCOPES
     credentials_type = credential_info.get("type")
